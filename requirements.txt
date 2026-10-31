@@ -1,5 +1,5 @@
 flask
-okx
+python-okx
 requests
 gunicorn
 
