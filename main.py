@@ -1,49 +1,61 @@
-import ccxt, time, threading, os, json, random
 from flask import Flask
+import os
+import hmac
+import base64
+import hashlib
+import requests
 from datetime import datetime
 
-API_KEY = os.getenv("BINANCE_API_KEY", "")
-API_SECRET = os.getenv("BINANCE_API_SECRET", "")
 app = Flask(__name__)
 
-BRAIN_FILE = "singularity.json"
-TRADES = []
+OKX_API_KEY = os.getenv("OKX_API_KEY", "").strip()
+OKX_SECRET = os.getenv("OKX_SECRET", "").strip()
+OKX_PASSPHRASE = os.getenv("OKX_PASSPHRASE", "").strip()
+BASE_URL = "https://www.okx.com"
 
-if os.path.exists(BRAIN_FILE):
-    with open(BRAIN_FILE, 'r') as f: BRAIN = json.load(f)
-else:
-    BRAIN = {"generation":0,"iq":100,"stage":"V23 LIVE"}
+def okx_sign(ts, method, path, body=""):
+    msg = f"{ts}{method}{path}{body}"
+    mac = hmac.new(OKX_SECRET.encode(), msg.encode(), hashlib.sha256)
+    return base64.b64encode(mac.digest()).decode()
+
+def get_balance():
+    try:
+        ts = datetime.utcnow().isoformat()[:-3] + 'Z'
+        method = "GET"
+        path = "/api/v5/account/balance"
+        sign = okx_sign(ts, method, path, "")
+        headers = {
+            "OK-ACCESS-KEY": OKX_API_KEY,
+            "OK-ACCESS-SIGN": sign,
+            "OK-ACCESS-TIMESTAMP": ts,
+            "OK-ACCESS-PASSPHRASE": OKX_PASSPHRASE,
+            "Content-Type": "application/json"
+        }
+        r = requests.get(BASE_URL+path, headers=headers, timeout=10)
+        data = r.json()
+        print(f"OKX RESPONSE: {data}", flush=True)
+        if data.get("code")=="0":
+            for a in data["data"][0]["details"]:
+                if a["ccy"]=="USDT":
+                    print(f"FREE USDT: {a['availBal']}", flush=True)
+                    return a['availBal']
+        return f"Error: {data}"
+    except Exception as e:
+        print(f"ERR: {e}", flush=True)
+        return str(e)
+
+print("=== V23 OKX STARTING ===", flush=True)
+bal = get_balance()
+print(f"=== LIVE MODE OKX ACTIVE - {bal} ===", flush=True)
 
 @app.route('/')
 def home():
-    trades_html = ""
-    for t in TRADES[-5:]:
-        trades_html += f"<div>{t}</div>"
-    return f"""
-    <h1>V23 INFINITY LIVE - FREE 24/7</h1>
-    <p>IQ: {BRAIN.get('iq')} | Gen: {BRAIN.get('generation')}</p>
-    <p>FREE MODE - No Card Needed</p>
-    <hr>{trades_html}
-    """
+    b = get_balance()
+    return f"<h1>V23 INFINITY LIVE - OKX</h1><p>USDT: {b}</p><p>Time: {datetime.now()}</p><p><a href='/balance'>Balance API</a></p>"
 
-def trading_loop():
-    print("=== V23 REAL LIVE FREE | STARTED ===", flush=True)
-    exchange = ccxt.binance({
-        'apiKey': API_KEY,
-        'secret': API_SECRET,
-        'enableRateLimit': True,
-    })
-    while True:
-        try:
-            balance = exchange.fetch_balance()
-            free_usdt = balance['USDT']['free'] if 'USDT' in balance else 0
-            print(f"FREE USDT: {free_usdt} | IQ: {BRAIN.get('iq')}", flush=True)
-            time.sleep(60)
-        except Exception as e:
-            print(f"Bot Error: {e}", flush=True)
-            time.sleep(30)
+@app.route('/balance')
+def bal_route():
+    return {"usdt": get_balance(), "exchange": "OKX", "live": True}
 
-threading.Thread(target=trading_loop, daemon=True).start()
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=10000)
