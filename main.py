@@ -1,10 +1,30 @@
+import os, time, threading
 from flask import Flask
-import os
+import ccxt
+
 app=Flask(__name__)
+API=os.getenv("OKX_API_KEY","").strip()
+SEC=os.getenv("OKX_SECRET_KEY","").strip()
+PAS=os.getenv("OKX_PASSPHRASE","").strip()
+LOG=[]
+
+def bot():
+    while True:
+        try:
+            ex=ccxt.okx({'apiKey':API,'secret':SEC,'password':PAS,'enableRateLimit':True})
+            b=ex.fetch_balance()
+            usdt=b.get('USDT',{}).get('free',0)
+            t=ex.fetch_ticker('BTC/USDT')
+            LOG.append(f"✅ LIVE USDT:{usdt} BTC:{t['last']}")
+        except Exception as e:
+            LOG.append(f"❌ {str(e)[:300]}")
+        time.sleep(15)
+
+threading.Thread(target=bot,daemon=True).start()
+
 @app.route("/")
 def home():
-    k=os.getenv("OKX_API_KEY","NOT FOUND")
-    s=os.getenv("OKX_SECRET_KEY","NOT FOUND")
-    p=os.getenv("OKX_PASSPHRASE","NOT FOUND")
-    return f"<h1>فحص Render</h1><p>API_KEY: {k[:10]}... len={len(k)}</p><p>SECRET: {s[:10] if s!='NOT FOUND' else s} len={len(s) if s!='NOT FOUND' else 0}</p><p>PASSPHRASE: {p} len={len(p) if p!='NOT FOUND' else 0}</p><p><br>اذا طلع NOT FOUND معناه ما حطيته في Render Environment!</p>"
-app.run(host="0.0.0.0",port=10000)
+    return f"<h1>✅ V31 LIVE</h1>API {API[:8]}..<br>Balance<br>{'<br>'.join(LOG[-10:])}"
+
+if __name__=="__main__":
+    app.run(host="0.0.0.0",port=10000)
