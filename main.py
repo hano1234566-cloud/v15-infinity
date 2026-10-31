@@ -1,123 +1,173 @@
-import os, time, threading
+import os, time, threading, random
 from flask import Flask, render_template_string
 import okx.Account as Account
 import okx.Trade as Trade
 import okx.MarketData as Market
 
 app = Flask(__name__)
-
 API_KEY = os.getenv("OKX_API_KEY")
 SECRET = os.getenv("OKX_SECRET")
 PASSPHRASE = os.getenv("OKX_PASSPHRASE")
-FLAG = "0"  # 0=حقيقي
+FLAG = "0"
 
-GEN = 216
-IQ = 568
-ACTIVE_TRADES = []
-HISTORY = ["V26 REAL ACTIVATED - REAL MONEY MODE"]
-BALANCE = 19.49
+GEN=216; IQ=568; TOTAL_PNL=0.0; COMPOUND_LEVEL=1
+CONFIG={"lev":3,"status":"RUNNING","max_trades":2}
+SPOT_TRADES=[]; FUT_TRADES=[]; HISTORY=["🔥 V29 HYBRID COMPOUND بدأ - سبوت+فيوتشر"]
 
-account_api = Account.AccountAPI(API_KEY, SECRET, PASSPHRASE, False, FLAG)
-trade_api = Trade.TradeAPI(API_KEY, SECRET, PASSPHRASE, False, FLAG)
-market_api = Market.MarketAPI(API_KEY, SECRET, PASSPHRASE, False, FLAG)
+acct = Account.AccountAPI(API_KEY, SECRET, PASSPHRASE, False, FLAG)
+trade = Trade.TradeAPI(API_KEY, SECRET, PASSPHRASE, False, FLAG)
+market = Market.MarketAPI(API_KEY, SECRET, PASSPHRASE, False, FLAG)
+
+COINS_SPOT=["DOGE-USDT","PEPE-USDT","SHIB-USDT","BONK-USDT"]
+COINS_FUT=["DOGE-USDT-SWAP","PEPE-USDT-SWAP","SHIB-USDT-SWAP","BONK-USDT-SWAP"]
 
 def get_price(inst):
-    try:
-        r = market_api.get_ticker(instId=inst)
-        return float(r['data'][0]['last'])
+    try: return float(market.get_ticker(instId=inst)['data'][0]['last'])
     except: return None
 
-def buy_real(inst, usd=5):
+def open_spot(inst):
     try:
-        price = get_price(inst)
-        if not price: return False
-        sz = str(round(usd/price, 2))  # كمية DOGE
-        # أمر سوق حقيقي
-        order = trade_api.place_order(instId=inst, tdMode="cash", side="buy", ordType="market", sz=sz)
-        HISTORY.append(f"REAL BUY {inst} {sz} @ {price} | {order['data'][0]['sMsg']}")
-        ACTIVE_TRADES.append({"coin":inst,"buy_price":price,"size":usd,"highest":price,"pnl":0,"sz":sz})
+        p=get_price(inst)
+        sz="20" if "DOGE" in inst else "1000000"
+        o=trade.place_order(instId=inst, tdMode="cash", side="buy", ordType="market", sz=sz)
+        SPOT_TRADES.append({"coin":inst,"entry":p,"pnl":0,"highest":p,"type":"SPOT"})
+        HISTORY.append(f"💎 SPOT BUY {inst} @ {p}")
         return True
     except Exception as e:
-        HISTORY.append(f"BUY FAIL {inst}: {e}")
-        return False
+        HISTORY.append(f"SPOT FAIL {e}"); return False
 
-def sell_real(trade):
+def open_fut(inst, side):
     try:
-        order = trade_api.place_order(instId=trade['coin'], tdMode="cash", side="sell", ordType="market", sz=trade['sz'])
-        HISTORY.append(f"REAL SELL {trade['coin']} PnL {trade['pnl']:.2f}% | {order['data'][0]['sMsg']}")
-        ACTIVE_TRADES.remove(trade)
+        acct.set_leverage(instId=inst, lever=str(CONFIG["lev"]), mgnMode="isolated")
+        sz="15"
+        posSide="long" if side=="buy" else "short"
+        side_o="buy" if side=="buy" else "sell"
+        trade.place_order(instId=inst, tdMode="isolated", side=side_o, posSide=posSide, ordType="market", sz=sz)
+        p=get_price(inst)
+        FUT_TRADES.append({"coin":inst,"side":side,"entry":p,"pnl":0,"highest":p,"lowest":p,"type":"FUT"})
+        HISTORY.append(f"⚡ FUT {side.upper()} {inst} x{CONFIG['lev']} @ {p}")
         return True
     except Exception as e:
-        HISTORY.append(f"SELL FAIL {e}")
-        return False
+        HISTORY.append(f"FUT FAIL {e}"); return False
 
-def auto_trader():
+def close_trade(t, lst):
+    try:
+        if t["type"]=="SPOT":
+            trade.place_order(instId=t["coin"], tdMode="cash", side="sell", ordType="market", sz="20")
+        else:
+            side="sell" if t["side"]=="buy" else "buy"
+            posSide="long" if t["side"]=="buy" else "short"
+            trade.place_order(instId=t["coin"], tdMode="isolated", side=side, posSide=posSide, ordType="market", sz="15")
+        global TOTAL_PNL
+        TOTAL_PNL+=t["pnl"]
+        HISTORY.append(f"💰 CLOSE {t['coin']} {t['pnl']:.1f}% | اجمالي {TOTAL_PNL:.1f}%")
+        lst.remove(t)
+        # كومباوند - كل ما ربح يزود صفقات
+        if TOTAL_PNL>10 and CONFIG["max_trades"]==2:
+            CONFIG["max_trades"]=3; HISTORY.append("🚀 LEVEL UP! صار يفتح 3 صفقات!")
+        if TOTAL_PNL>25 and CONFIG["max_trades"]==3:
+            CONFIG["max_trades"]=4; HISTORY.append("🚀🚀 LEVEL UP! صار يفتح 4 صفقات!")
+        if TOTAL_PNL>50:
+            CONFIG["max_trades"]=5; HISTORY.append("🔥🔥🔥 وحش! 5 صفقات بنفس الوقت!")
+    except Exception as e: HISTORY.append(f"CLOSE ERR {e}")
+
+def hybrid_loop():
     global GEN, IQ
     while True:
         try:
-            # 1. ادارة الصفقات المفتوحة
-            for t in ACTIVE_TRADES[:]:
-                price = get_price(t['coin'])
-                if not price: continue
-                t['highest'] = max(t['highest'], price)
-                t['pnl'] = ((price - t['buy_price'])/t['buy_price'])*100
-                trailing = ((t['highest'] - price)/t['highest'])*100
-                if t['pnl'] <= -1.2 or (t['pnl'] >= 2.8 and trailing >= 1.0):
-                    sell_real(t)
-                    GEN+=1; IQ+=1
-            
-            # 2. دخول جديد اذا ما فيه صفقات
-            if len(ACTIVE_TRADES) < 1:
-                # يختار عملة فيها سيولة عالية
-                for inst in ["DOGE-USDT","PEPE-USDT","SHIB-USDT","BTC-USDT"]:
-                    price = get_price(inst)
-                    if price:
-                        buy_real(inst, 5)
-                        GEN+=1; IQ+=1
-                        break
+            all_trades=SPOT_TRADES+FUT_TRADES
+            # ادارة
+            for t in all_trades[:]:
+                p=get_price(t["coin"])
+                if not p: continue
+                t["highest"]=max(t["highest"],p)
+                if "lowest" in t: t["lowest"]=min(t["lowest"],p)
+                if t["type"]=="SPOT":
+                    t["pnl"]=((p-t["entry"])/t["entry"])*100
+                    if t["pnl"]<=-2 or t["pnl"]>=5:
+                        close_trade(t, SPOT_TRADES); GEN+=1; IQ+=1
+                else:
+                    if t["side"]=="buy":
+                        t["pnl"]=((p-t["entry"])/t["entry"])*100*CONFIG["lev"]
+                        trail=(t["highest"]-p)/t["highest"]*100*CONFIG["lev"]
+                    else:
+                        t["pnl"]=((t["entry"]-p)/t["entry"])*100*CONFIG["lev"]
+                        trail=(p-t["lowest"])/t["lowest"]*100*CONFIG["lev"]
+                    if t["pnl"]<=-10 or (t["pnl"]>=18) or t["pnl"]>=30:
+                        close_trade(t, FUT_TRADES); GEN+=1; IQ+=2
+
+            # دخول جديد - مركب
+            if len(all_trades)<CONFIG["max_trades"] and CONFIG["status"]=="RUNNING":
+                # 50% سبوت 50% فيوتشر
+                if random.random()>0.5 and len(SPOT_TRADES)<3:
+                    inst=random.choice(COINS_SPOT)
+                    if get_price(inst): open_spot(inst); GEN+=1
+                else:
+                    if len(FUT_TRADES)<3:
+                        inst=random.choice(COINS_FUT)
+                        side=random.choice(["buy","sell"])
+                        if get_price(inst): open_fut(inst, side); GEN+=1
             time.sleep(15)
         except Exception as e:
-            HISTORY.append(f"ERR {e}")
-            time.sleep(10)
+            HISTORY.append(f"LOOP {e}"); time.sleep(5)
 
-threading.Thread(target=auto_trader, daemon=True).start()
+threading.Thread(target=hybrid_loop, daemon=True).start()
 
-HTML = """
+HTML="""
 <!DOCTYPE html><html dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>V26 REAL</title><style>
-body{background:#0a0a0f;color:#fff;font-family:system-ui;margin:0;padding:15px}
-.card{background:#15151f;border-radius:16px;padding:15px;margin-bottom:12px;border:1px solid #222}
-.green{color:#00ff88} .red{color:#ff3b3b} .yellow{color:#ffcc00}
-.big{font-size:28px;font-weight:800}.grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
-.badge{padding:4px 10px;border-radius:20px;font-size:12px;background:#222}
+<title>V29 HYBRID</title><style>
+body{background:#07070c;color:#fff;font-family:system-ui;margin:0;padding:10px}
+.card{background:#13131d;border-radius:14px;padding:12px;margin-bottom:8px;border:1px solid #222}
+.big{font-size:22px;font-weight:900} .green{color:#00ff88} .red{color:#ff3b3b} .yellow{color:#ffcc00}
+.grid{display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:6px}
+.badge{padding:2px 7px;border-radius:20px;background:#222;font-size:10px}
 </style><meta http-equiv="refresh" content="5"></head><body>
-<h2>🔴 V26 REAL MONEY <span style="background:red;padding:4px 10px;border-radius:20px">حقيقي</span></h2>
+<h3>👑 V29 HYBRID COMPOUND <span class="badge">GEN {{GEN}} IQ {{IQ}}</span></h3>
+
+<div class="card" style="border:1px solid #00ff88">
+<div>💰 اجمالي الربح المركب: <b class="big {{'green' if total>=0 else 'red'}}">{{"%.2f"|format(total)}}%</b> | مستوى {{level}} | يفتح {{cfg.max_trades}} صفقات</div>
+<div style="background:#222;height:8px;border-radius:4px;margin-top:6px"><div style="width:{{[total,100]|min}}%;background:#00ff88;height:8px;border-radius:4px"></div></div>
+<div style="font-size:10px;margin-top:4px">10% -> 3 صفقات | 25% -> 4 صفقات | 50% -> 5 صفقات (كرة ثلج)</div>
+</div>
+
 <div class="grid">
-<div class="card"><div>الجيل</div><div class="big yellow">GEN {{GEN}}</div></div>
-<div class="card"><div>الذكاء</div><div class="big green">IQ {{IQ}}</div></div>
-<div class="card"><div>صفقات</div><div class="big">{{trades|length}} مفتوحة</div></div>
-<div class="card"><div>الوضع</div><div class="big red">● حقيقي</div></div>
+<div class="card"><div style="font-size:10px">سبوت</div><div class="big">{{spot|length}}</div></div>
+<div class="card"><div style="font-size:10px">فيوتشر</div><div class="big">{{fut|length}}</div></div>
+<div class="card"><div style="font-size:10px">الكل</div><div class="big">{{spot|length + fut|length}}/{{cfg.max_trades}}</div></div>
+<div class="card"><div style="font-size:10px">رافعة</div><div class="big">x{{cfg.lev}}</div></div>
 </div>
-<div class="card"><h3>📈 صفقات حقيقية في OKX</h3>
-{% for t in trades %}
-<div style="background:#1f1f2e;padding:12px;border-radius:12px;margin-top:8px;border-right:4px solid {{'green' if t.pnl>0 else 'red'}}">
-<b>{{t.coin}}</b> | دخول {{t.buy_price}} | <b class="{{'green' if t.pnl>0 else 'red'}}">{{"%.2f"|format(t.pnl)}}%</b>
-<br><small>حجم ${{t.size}} | كمية {{t.sz}}</small>
+
+<div class="card">
+<h4>💎 سبوت (آمن - يحتفظ بالعملة)</h4>
+{% for t in spot %}
+<div style="background:#1a1a2a;padding:8px;border-radius:8px;margin-top:5px;border-right:3px solid {{'green' if t.pnl>0 else 'red'}}">
+{{t.coin}} | {{t.entry}} -> PnL <b class="{{'green' if t.pnl>0 else 'red'}}">{{"%.2f"|format(t.pnl)}}%</b>
 </div>
-{% else %}
-<div>لا يوجد صفقات - سيشتري خلال 15 ثانية...</div>
-{% endfor %}
+{% else %}<div style="font-size:12px">لا يوجد سبوت</div>{% endfor %}
 </div>
-<div class="card"><h3>📜 سجل الأوامر الحقيقية</h3>
-{% for h in history[::-1][:10] %}<div style="font-size:12px;padding:4px 0;border-bottom:1px solid #222">{{h}}</div>{% endfor %}
+
+<div class="card">
+<h4>⚡ فيوتشر (صياد x{{cfg.lev}})</h4>
+{% for t in fut %}
+<div style="background:#1a1a2a;padding:8px;border-radius:8px;margin-top:5px;border-right:3px solid {{'green' if t.pnl>0 else 'red'}}">
+{{t.coin.replace('-USDT-SWAP','')}} {{t.side.upper()}} x{{cfg.lev}} | PnL <b class="{{'green' if t.pnl>0 else 'red'}}">{{"%.2f"|format(t.pnl)}}%</b>
 </div>
-<div class="card" style="text-align:center;color:#ff3b3b">⚠️ هذا تداول حقيقي بفلوسك - SL -1.2% | TP 2.8%</div>
+{% else %}<div style="font-size:12px">لا يوجد فيوتشر</div>{% endfor %}
+</div>
+
+<div class="card"><h4>📜 سجل الوحش</h4>
+{% for h in history[::-1][:12] %}<div style="font-size:11px;padding:2px 0;border-bottom:1px solid #1a1a1a">{{h}}</div>{% endfor %}
+</div>
 </body></html>
 """
 
 @app.route("/")
 def index():
-    return render_template_string(HTML, GEN=GEN, IQ=IQ, trades=ACTIVE_TRADES, history=HISTORY)
+    level=1
+    if TOTAL_PNL>50: level=4
+    elif TOTAL_PNL>25: level=3
+    elif TOTAL_PNL>10: level=2
+    return render_template_string(HTML, GEN=GEN, IQ=IQ, spot=SPOT_TRADES, fut=FUT_TRADES, history=HISTORY, cfg=CONFIG, total=TOTAL_PNL, level=level)
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+if __name__=="__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT",10000)))
