@@ -1,2 +1,4 @@
-ccxt
 flask
+okx
+requests
+
