@@ -4,7 +4,9 @@ import ccxt
 from collections import deque, defaultdict
 import statistics
 
-https://github.com/hano1234566-cloud/v15-infinity/edit/main/main.py
+API_KEY = os.getenv("OKX_API_KEY", "").strip()
+SECRET = os.getenv("OKX_SECRET_KEY", "").strip()
+PASSPHRASE = os.getenv("OKX_PASSPHRASE", "").strip()
 
 SYMBOLS = ["BTC/USDT","ETH/USDT","SOL/USDT","DOGE/USDT","PEPE/USDT","SHIB/USDT","WIF/USDT","BONK/USDT","FLOKI/USDT","1000PEPE/USDT","MEME/USDT","ORDI/USDT","SUI/USDT","ARB/USDT","AVAX/USDT","LINK/USDT"]
 
