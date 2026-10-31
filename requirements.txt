@@ -1,4 +1,5 @@
 flask
 okx
 requests
+gunicorn
 
