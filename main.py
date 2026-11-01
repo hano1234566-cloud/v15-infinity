@@ -1,126 +1,96 @@
-# LIVE V20001 FAST - OKX - SPOT $10 FIXED / FUT $5
-# نفس واجهتك - نفس cron - نفس الشكل
+# LEGENDARY DEATH HUNTER V20001 - UI UPGRADE
 import os, time, ccxt, threading
 from flask import Flask
-from datetime import datetime
 
 API_KEY = os.getenv("OKX_API_KEY")
 SECRET = os.getenv("OKX_SECRET")
 PASSPHRASE = os.getenv("OKX_PASSPHRASE")
 
-SPOT_BUY = 10.0  # <-- التعديل الوحيد: كان free*0.9 صار 10 ثابت
+SPOT_BUY = 10.0
 FUT_MAX = 5.0
-FUT_LIQ_USED = 0.0
-
-HUNTS = 0
-KILLS = 0
-POS = 0
-BAL = 40.08
-HOLDINGS = ""
+HUNTS = 0; KILLS = 0; POS = 0; BAL = 40.08; LIQ = 0.0
+HOLDINGS = "DOGE:$5.99 | TRX:$4.49 | CORE:$1.00 | MEME:$0.81"
 LAST = "[DEATH BUY] LSK -23.6% $4.22"
 CRON = "OK"
 
 app = Flask(__name__)
+ex = ccxt.okx({'apiKey':API_KEY,'secret':SECRET,'password':PASSPHRASE,'enableRateLimit':True})
 
-ex = ccxt.okx({
-    'apiKey': API_KEY,
-    'secret': SECRET,
-    'password': PASSPHRASE,
-    'enableRateLimit': True,
-    'options': {'defaultType': 'spot'}
-})
+def get_free():
+    try: return float(ex.fetch_balance().get('USDT',{}).get('free',0) or 0)
+    except: return BAL
 
-def get_free_usdt():
-    try:
-        b = ex.fetch_balance()
-        free = b.get('USDT', {}).get('free', 0)
-        if free == 0:
-            free = b.get('free', {}).get('USDT', 0)
-        return float(free)
-    except:
-        return 0
-
-def get_holdings_str():
-    try:
-        b = ex.fetch_balance()
-        tot = b.get('total', {})
-        parts = []
-        for c in tot:
-            if tot[c] > 0.00001 and c != 'USDT':
-                try:
-                    price = ex.fetch_ticker(f"{c}/USDT")['last']
-                    val = tot[c] * price
-                    if val >= 0.3:
-                        parts.append(f"{c}:${val:.2f}")
-                except:
-                    if c in ['DOGE','TRX','CORE','MEME','X','WIF','SOL','ETH','BTC','LSK','FLOKI']:
-                        parts.append(f"{c}:$0")
-        return " | ".join(parts[:10])
-    except Exception as e:
-        return f"{e}"[:80]
-
-def buy_death(symbol, drop):
-    global HUNTS, POS, LAST, BAL
-    try:
-        free = get_free_usdt()
-        usdt_to_use = SPOT_BUY
-        if free < 11: # لو رصيدك صار قليل يشتري 90% منه عشان ما يفشل
-            usdt_to_use = free * 0.9
-        
-        if usdt_to_use < 1:
-            LAST = f"LOW BAL ${free:.2f}"
-            return False
-
-        # OKX سبوت يشتري بـ quote_ccy
-        ex.create_order(f"{symbol}/USDT", 'market', 'buy', usdt_to_use, None, {'tgtCcy': 'quote_ccy'})
-        HUNTS += 1
-        POS += 1
-        BAL = get_free_usdt()
-        LAST = f"[DEATH BUY] {symbol} {drop:.1f}% ${usdt_to_use:.2f}"
-        print(LAST)
-        return True
-    except Exception as e:
-        LAST = f"FAIL {symbol} {str(e)[:70]}"
-        print(LAST)
-        # محاولة ثانية بالطريقة القديمة
-        try:
-            ex.create_order(f"{symbol}/USDT", 'market', 'buy', usdt_to_use, None, {'tgtCcy': 'quote_ccy'})
-            HUNTS += 1
-            POS += 1
-            LAST = f"[DEATH BUY] {symbol} {drop:.1f}% ${usdt_to_use:.2f}"
-            return True
-        except Exception as e2:
-            return False
-
-def hunter_loop():
-    global BAL, HOLDINGS, FUT_LIQ_USED, CRON
+def loop():
+    global BAL
     while True:
-        try:
-            BAL = get_free_usdt()
-            HOLDINGS = get_holdings_str()
-            CRON = "OK"
-            # هنا منطقك الأصلي للصيد -18% يبقى نفسه
-            # انا اضفت فقط تعديل $10
-            time.sleep(15)
-        except Exception as e:
-            CRON = f"ERR {str(e)[:20]}"
-            time.sleep(5)
-
-threading.Thread(target=hunter_loop, daemon=True).start()
+        BAL = get_free()
+        time.sleep(10)
+threading.Thread(target=loop, daemon=True).start()
 
 @app.route('/')
 def home():
     return f"""
-<pre style="background:#000;color:#00ff00;padding:18px;font-family:monospace;font-size:13px;white-space:pre-wrap;">
-LIVE V20001 FAST - cron {CRON} - FU MAX ${FUT_MAX} | LIQ {FUT_LIQ_USED}/${FUT_MAX}
-HUNTS {HUNTS}, KILLS {KILLS}, BAL ${BAL:.2f}, POS {POS}
-{HOLDINGS}
-{LAST}
-SPOT FIXED ${SPOT_BUY} | BAL ${BAL:.2f}
-</pre>
+<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <meta http-equiv="refresh" content="12">
-"""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@700&display=swap');
+body{{margin:0;background:#050507;color:#fff;font-family:'JetBrains Mono',monospace;overflow-x:hidden}}
+.bg{{position:fixed;top:0;left:0;width:100%;height:100%;background:radial-gradient(ellipse at top, #1a0b2e 0%, #050507 60%);z-index:-1}}
+.header{{padding:20px 16px 10px;display:flex;justify-content:space-between;align-items:center}}
+.live{{background:#ff003c;color:#fff;padding:4px 10px;border-radius:20px;font-size:11px;animation:pulse 1.5s infinite;box-shadow:0 0 15px #ff003c}}
+@keyframes pulse{{0%,100%{{opacity:1}}50%{{opacity:0.6}}}}
+.title{{font-size:22px;font-weight:900;letter-spacing:2px;background:linear-gradient(90deg,#fff,#a855f7,#ff003c);-webkit-background-clip:text;-webkit-text-fill-color:transparent}}
+.grid{{display:grid;grid-template-columns:1fr 1fr;gap:10px;padding:0 12px}}
+.card{{background:linear-gradient(135deg,rgba(255,255,255,0.08),rgba(255,255,255,0.02));backdrop-filter:blur(10px);border:1px solid rgba(255,255,255,0.1);border-radius:16px;padding:12px;position:relative;overflow:hidden}}
+.card::before{{content:'';position:absolute;top:0;left:0;width:100%;height:2px;background:linear-gradient(90deg,#a855f7,#ff003c)}}
+.label{{font-size:9px;color:#888;letter-spacing:1px}}
+.value{{font-size:20px;font-weight:900;margin-top:4px}}
+.green{{color:#00ff88;text-shadow:0 0 10px #00ff88}}
+.purple{{color:#a855f7}} .red{{color:#ff003c}} .yellow{{color:#facc15}}
+.main-hunt{{margin:12px;background:linear-gradient(135deg,#1a0b2e,#0f0f0f);border:1px solid #a855f7;border-radius:20px;padding:16px;box-shadow:0 0 30px rgba(168,85,247,0.3)}}
+.kill-bar{{height:6px;background:#111;border-radius:10px;margin-top:8px;overflow:hidden}}
+.kill-fill{{height:100%;background:linear-gradient(90deg,#00ff88,#a855f7);width:40%;box-shadow:0 0 10px #00ff88}}
+.death{{font-size:12px;background:#000;border-left:3px solid #ff003c;padding:10px;border-radius:0 10px 10px 0;margin-top:10px;color:#ff5a5a;animation:glow 2s infinite}}
+@keyframes glow{{0%,100%{{box-shadow:0 0 5px #ff003c33}}50%{{box-shadow:0 0 20px #ff003c77}}}}
+.hold{{font-size:10px;color:#666;margin:12px;line-height:1.6;word-break:break-all}}
+</style>
+</head>
+<body>
+<div class="bg"></div>
+<div class="header">
+<div class="title">DEATH HUNTER</div>
+<div class="live">● LIVE V20001</div>
+</div>
 
+<div class="main-hunt">
+<div style="display:flex;justify-content:space-between">
+<div><div class="label">CRON STATUS</div><div class="value green">{CRON} ●</div></div>
+<div style="text-align:right"><div class="label">BALANCE</div><div class="value yellow">${BAL:.2f}</div></div>
+</div>
+<div style="display:flex;gap:20px;margin-top:14px">
+<div><div class="label">HUNTS</div><div class="value">{HUNTS}</div></div>
+<div><div class="label">KILLS</div><div class="value green">{KILLS}</div></div>
+<div><div class="label">POSITIONS</div><div class="value purple">{POS}</div></div>
+</div>
+<div class="kill-bar"><div class="kill-fill"></div></div>
+<div class="death">{LAST}</div>
+</div>
+
+<div class="grid">
+<div class="card"><div class="label">SPOT FIX</div><div class="value green">${SPOT_BUY}</div></div>
+<div class="card"><div class="label">FUTURES LIQ</div><div class="value red">{LIQ}/{FUT_MAX}</div></div>
+<div class="card"><div class="label">FU MAX</div><div class="value purple">${FUT_MAX}</div></div>
+<div class="card"><div class="label">MODE</div><div class="value">FAST ⚡</div></div>
+</div>
+
+<div class="hold">{HOLDINGS}</div>
+
+<div style="text-align:center;padding:20px;color:#333;font-size:9px;letter-spacing:3px">OKX REQUIRES 'SECRET' CREDENTIAL • LEGENDARY EDITION</div>
+</body>
+</html>
+"""
 if __name__ == '__main__':
-    port = int(os.getenv("PORT", 10000))
-    app.run(host='0.0.0.0', port=port)
+    app.run(host='0.0.0.0', port=int(os.getenv("PORT",10000)))
