@@ -6,7 +6,7 @@ SECRET = (os.getenv("OKX_SECRET_KEY","") or os.getenv("OKX_SECRET","")).strip()
 PASSPHRASE = os.getenv("OKX_PASSPHRASE","").strip()
 
 BAL=21.10; LIQ=0.0; TEST_RESULT="لم يتم الفحص بعد"
-LAST="Engine ready - RAW ORDER NO posSide"
+LAST="Engine ready - HEDGE long/short"
 
 app = Flask(__name__)
 
@@ -16,7 +16,6 @@ def get_ex():
         'secret': SECRET,
         'password': PASSPHRASE,
         'enableRateLimit': True,
-        'options': {'defaultType': 'swap'},
     })
 
 @app.route('/test_fut')
@@ -24,47 +23,56 @@ def test_fut():
     global TEST_RESULT, BAL
     try:
         ex = get_ex()
-        ex.load_markets()
+        # اعرف وضع الحساب
+        try:
+            cfg = ex.private_get_account_config()
+            pos_mode = cfg['data'][0]['posMode']
+        except:
+            pos_mode = "long_short_mode (افتراضي)"
+        
         bal = ex.fetch_balance()
         BAL = float(bal.get('USDT',{}).get('free',0) or 21.10)
         
-        # ضبط رافعة 3x
+        # ضبط رافعة
         try:
-            ex.set_leverage(3, 'AVAX/USDT:USDT', {'mgnMode':'isolated'})
+            ex.private_post_account_set_leverage({
+                'instId': 'AVAX-USDT-SWAP',
+                'lever': '3',
+                'mgnMode': 'isolated',
+                'posSide': 'long'
+            })
         except: pass
         
-        # طلب خام مباشر ل OKX - بدون posSide نهائيا
+        # طلب خام صحيح لحساب Hedge
         order_buy = {
             'instId': 'AVAX-USDT-SWAP',
             'tdMode': 'isolated',
             'side': 'buy',
+            'posSide': 'long',
             'ordType': 'market',
-            'sz': '1.2',
+            'sz': '1',
         }
         
-        # ارسال مباشر
         result = ex.private_post_trade_order(order_buy)
         
-        time.sleep(3)
-        
-        order_sell = {
-            'instId': 'AVAX-USDT-SWAP',
-            'tdMode': 'isolated',
-            'side': 'sell',
-            'ordType': 'market',
-            'sz': '1.2',
-        }
-        ex.private_post_trade_order(order_sell)
-        
-        TEST_RESULT = f"✅ SUCCESS: الفيوتشر شغال 100%!<br>فتح وسكر 1.2 AVAX x3<br>رد OKX: {str(result)[:100]}<br>رصيدك ${BAL:.2f}<br><br>البوت جاهز يصيد لين المغرب"
+        # تأكد هل نجح
+        if result['code'] == '0' and result['data'][0]['sCode'] == '0':
+            time.sleep(3)
+            order_sell = {
+                'instId': 'AVAX-USDT-SWAP',
+                'tdMode': 'isolated',
+                'side': 'sell',
+                'posSide': 'long',
+                'ordType': 'market',
+                'sz': '1',
+            }
+            ex.private_post_trade_order(order_sell)
+            TEST_RESULT = f"✅ SUCCESS: الفيوتشر شغال 100%!<br>الوضع: {pos_mode}<br>فتح وسكر 1 AVAX x3<br>رصيدك ${BAL:.2f}<br><br>البوت جاهز يصيد"
+        else:
+            TEST_RESULT = f"❌ OKX رد: {str(result)[:500]}"
         
     except Exception as e:
-        err = str(e)
-        # لو نجح الشراء بس فشل البيع - يعتبر نجاح
-        if "51000" not in err or "buy" in err.lower():
-            TEST_RESULT = f"✅ جزئي: فتح صفقة بس فشل اغلاق<br>{err[:300]}<br>ادخل OKX وسكرها يدوي"
-        else:
-            TEST_RESULT = f"❌ {err[:400]}"
+        TEST_RESULT = f"❌ {str(e)[:500]}"
     return home()
 
 @app.route('/')
@@ -78,7 +86,7 @@ body{{margin:0;background:#050507;color:#fff;font-family:monospace}}
 .btn{{display:block;background:linear-gradient(90deg,#a855f7,#ff003c);color:#fff;text-align:center;padding:14px;border-radius:12px;text-decoration:none;font-weight:900;margin:10px;font-size:14px}}
 .test{{background:#111;border:1px solid #333;padding:10px;border-radius:10px;margin:10px;font-size:11px;word-break:break-all}}
 </style></head><body>
-<div style="padding:16px;display:flex;justify-content:space-between"><div style="font-size:16px;font-weight:900">DEATH HUNTER</div><div class="live">● LIVE V20005 RAW</div></div>
+<div style="padding:16px;display:flex;justify-content:space-between"><div style="font-size:16px;font-weight:900">DEATH HUNTER</div><div class="live">● LIVE V20006 HEDGE</div></div>
 <div class="card">
 <div style="display:flex;justify-content:space-between"><div>BAL <span class="yellow">${BAL:.2f}</span></div><div>LIQ <span class="red">{LIQ}/15</span></div></div>
 <div style="margin-top:8px;background:#000;border-left:3px solid #00ff88;padding:8px;font-size:11px">{LAST}</div>
