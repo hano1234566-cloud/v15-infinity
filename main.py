@@ -1,34 +1,30 @@
-# V1000 LEGENDARY MERGED - SPOT + FUTURE - Self-Evolving Legendary
-# Both modules working - No buy stopped - Like Honey
-
+# V1000 LEGENDARY MERGED - FIXED FOR RENDER
+import os, time, threading
+from flask import Flask
 import ccxt
-import time
-import json
-import threading
-from datetime import datetime
 
-# ========= إعدادات OKX =========
-API_KEY = "ضع مفتاحك"
-SECRET = "ضع سرك"
-PASSWORD = "ضع باسوردك"
+API_KEY = os.getenv("OKX_API_KEY", "ضع مفتاحك").strip()
+SECRET = os.getenv("OKX_SECRET_KEY", "ضع سرك").strip()
+PASSPHRASE = os.getenv("OKX_PASSPHRASE", "ضع باسوردك").strip()
 
-exchange = ccxt.okx({
-    'apiKey': API_KEY,
-    'secret': SECRET,
-    'password': PASSWORD,
-    'enableRateLimit': True,
-    'options': {'defaultType': 'spot'}
-})
+app = Flask(__name__)
+LOGS = []
 
-exchange_future = ccxt.okx({
-    'apiKey': API_KEY,
-    'secret': SECRET,
-    'password': PASSWORD,
-    'enableRateLimit': True,
-    'options': {'defaultType': 'swap'}
-})
+def log(m):
+    t = time.strftime("%H:%M:%S")
+    msg = f"{t} {m}"
+    LOGS.append(msg)
+    if len(LOGS) > 200: LOGS.pop(0)
+    print(msg, flush=True)
 
-# ========= قسم 1: سبوت - أسطوري =========
+def make_client(typ):
+    return ccxt.okx({
+        'apiKey': API_KEY, 'secret': SECRET, 'password': PASSPHRASE,
+        'enableRateLimit': True,
+        'options': {'defaultType': typ}
+    })
+
+# ===== SPOT =====
 class V1000_Spot_Legendary:
     def __init__(self):
         self.symbol = 'AVAX/USDT'
@@ -36,149 +32,75 @@ class V1000_Spot_Legendary:
         self.stop_price = 8.6640
         self.amount_usd = 1
         self.losses = 0
-        self.wins = 0
-        self.status = "شغال مثل الحلاوة"
-
-    def self_heal(self):
-        try:
-            exchange.fetch_balance()
-            return True
-        except Exception as e:
-            print(f"[SPOT SELF-HEAL] {e} - أصلح نفسي")
-            time.sleep(1)
-            return self.self_heal()
-
-    def self_learn(self, result):
-        if result == 'loss':
-            self.losses += 1
-            if self.losses >= 3:
-                self.buy_price *= 0.99
-                print(f"[SPOT LEGENDARY LEARN] غيرت سعر الشراء إلى {self.buy_price}")
-                self.losses = 0
-        else:
-            self.wins += 1
+        self.bought = False
 
     def run(self):
-        print("[SPOT LEGENDARY] بدأ - أسطوري شغال")
+        ex = make_client('spot')
+        log("[SPOT] أسطوري شغال مثل الحلاوة - يشتري AVAX")
         while True:
             try:
-                ticker = exchange.fetch_ticker(self.symbol)
-                price = ticker['last']
-                print(f"[SPOT] AVAX: {price} | شراء عند: {self.buy_price} | ستوب: {self.stop_price} | {self.status}")
-
-                # شراء شغال - مو متوقف
-                if price <= self.buy_price:
-                    amount = self.amount_usd / price
-                    print(f"[SPOT] >>> أشتري {amount} AVAX بـ 1$ عند {price}")
-                    try:
-                        # exchange.create_market_buy_order(self.symbol, amount)
-                        pass
-                    except Exception as e:
-                        self.self_heal()
-
-                # حماية
-                if price <= self.stop_price:
-                    print(f"[SPOT] >>> ستوب! أبيع الحماية عند {price}")
-
+                price = ex.fetch_ticker(self.symbol)['last']
+                log(f"[SPOT] AVAX {price} | شراء {self.buy_price} | ستوب {self.stop_price}")
+                if price <= self.buy_price and not self.bought:
+                    log(f"[SPOT] >>> شراء 1$ عند {price}")
+                    # ex.create_market_buy_order(self.symbol, self.amount_usd/price)
+                    self.bought = True
+                if price <= self.stop_price and self.bought:
+                    log(f"[SPOT] >>> ستوب حماية عند {price}")
+                    self.bought = False
+                if price > self.buy_price + 0.2: # إعادة تفعيل الشراء اذا طلع
+                    self.bought = False
                 time.sleep(5)
             except Exception as e:
-                print(f"[SPOT ERROR] {e}")
-                self.self_heal()
+                log(f"[SPOT ERR] {e} - أصلح نفسي بعد 5 ثواني")
+                time.sleep(5)
 
-# ========= قسم 2: فيوتشر - أسطوري =========
+# ===== FUTURE =====
 class V1000_Future_Legendary:
     def __init__(self):
         self.amount_usd = 1
-        self.leverage = 3
-        self.max_positions = 1
-        self.current_positions = 0
-        self.stop_pct = 2.5
-        self.target_pct = 6
         self.drop_needed = 5.0
         self.volume_needed = 10_000_000
+        self.current_positions = 0
+        self.max_positions = 1
         self.banned = {}
-        self.memory = {}
-        self.status = "سكانر أسطوري شغال"
-
-    def scan_all_futures(self):
-        try:
-            tickers = exchange_future.fetch_tickers()
-            candidates = []
-            for symbol, ticker in tickers.items():
-                if 'USDT:USDT' in symbol:  # فيوتشر
-                    change = ticker.get('percentage', 0) or 0
-                    volume = ticker.get('quoteVolume', 0) or 0
-                    last = ticker.get('last', 0) or 0
-                    if change <= -self.drop_needed and volume >= self.volume_needed and last > 0.01:
-                        if symbol not in self.banned:
-                            candidates.append((symbol, change, volume))
-            # رتب الأكثر نزولا
-            candidates.sort(key=lambda x: x[1])
-            return candidates
-        except Exception as e:
-            print(f"[FUTURE SCAN ERROR] {e}")
-            return []
-
-    def self_learn_future(self, symbol, result):
-        if result == 'loss':
-            self.memory[symbol] = self.memory.get(symbol, 0) - 1
-            if self.memory[symbol] <= -2:
-                self.banned[symbol] = time.time() + 86400
-                print(f"[FUTURE LEGENDARY LEARN] حظرت {symbol} 24 ساعة - عملة غدارة")
-        else:
-            self.memory[symbol] = self.memory.get(symbol, 0) + 1
-            if self.memory[symbol] >= 3:
-                self.amount_usd = 2
-                print(f"[FUTURE LEGENDARY] {symbol} أسطورية - أضاعف المبلغ إلى 2$")
-
-        # فك الحظر
-        for k in list(self.banned.keys()):
-            if time.time() > self.banned[k]:
-                del self.banned[k]
 
     def run(self):
-        print("[FUTURE LEGENDARY] بدأ - سكانر 200 عملة - أسطوري شغال")
+        ex = make_client('swap')
+        log("[FUTURE] سكانر 200 عملة شغال مثل الحلاوة")
         while True:
             try:
-                if self.current_positions < self.max_positions:
-                    candidates = self.scan_all_futures()
-                    print(f"[FUTURE] فحصت {len(candidates)} عملة تحقق الشروط | {self.status}")
-                    if candidates:
-                        sym, change, vol = candidates[0]
-                        print(f"[FUTURE] >>> دخول أسطوري {sym} نازلة {change}% حجم {vol} - 1$ 3X")
-                        self.current_positions += 1
-                        # هنا أمر الفيوتشر الحقيقي
-                        # exchange_future.set_leverage(self.leverage, sym)
-                        # exchange_future.create_market_buy_order(sym, self.amount_usd)
-                        # ستوب متحرك + هدف
-                else:
-                    print(f"[FUTURE] عندي صفقة شغالة - أنتظر")
-
+                tickers = ex.fetch_tickers()
+                cands = []
+                for sym, tk in tickers.items():
+                    if 'USDT:USDT' in sym:
+                        ch = tk.get('percentage') or 0
+                        vol = tk.get('quoteVolume') or 0
+                        if ch <= -self.drop_needed and vol >= self.volume_needed:
+                            if sym not in self.banned:
+                                cands.append((sym, ch, vol))
+                cands.sort(key=lambda x: x[1])
+                log(f"[FUTURE] فحصت {len(tickers)} | لقيت {len(cands)} عملة تحقق -5%")
+                if cands and self.current_positions < self.max_positions:
+                    sym, ch, vol = cands[0]
+                    log(f"[FUTURE] >>> دخول {sym} نازلة {ch:.2f}% حجم {vol} - 1$ 3X")
+                    self.current_positions = 1
+                    # هنا تحط أمرك الحقيقي + بعد 2 دقيقة تسوي current_positions=0 عشان يدخل غيرها
+                    threading.Timer(120, lambda: setattr(self, 'current_positions', 0)).start()
                 time.sleep(10)
             except Exception as e:
-                print(f"[FUTURE ERROR] {e}")
-                time.sleep(2)
+                log(f"[FUTURE ERR] {e}")
+                time.sleep(5)
 
-# ========= تشغيل مدمج - الاثنين مع بعض =========
-def start_legendary_merged():
-    spot = V1000_Spot_Legendary()
-    future = V1000_Future_Legendary()
+# تشغيل الاثنين
+spot = V1000_Spot_Legendary()
+future = V1000_Future_Legendary()
+threading.Thread(target=spot.run, daemon=True).start()
+threading.Thread(target=future.run, daemon=True).start()
 
-    t1 = threading.Thread(target=spot.run, daemon=True)
-    t2 = threading.Thread(target=future.run, daemon=True)
-    
-    t1.start()
-    t2.start()
-    
-    print("\n========== V1000 LEGENDARY MERGED ==========")
-    print("سبوت: شغال مثل الحلاوة - يشتري AVAX")
-    print("فيوتشر: شغال مثل الحلاوة - سكانر 200 عملة")
-    print("كل قسم يطور نفسه بنفسه - بدون تدخلك")
-    print("==========================================\n")
+@app.route('/')
+def index():
+    return f"<h2>V1000 LEGENDARY MERGED - شغال مثل الحلاوة</h2><h3>SPOT: AVAX يشتري عند 8.9050</h3><h3>FUTURE: سكانر 200 عملة</h3><pre>{chr(10).join(LOGS[-80:])}</pre><meta http-equiv='refresh' content='3'>"
 
-    while True:
-        time.sleep(1)
-
-# شغل
 if __name__ == "__main__":
-    start_legendary_merged()
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
