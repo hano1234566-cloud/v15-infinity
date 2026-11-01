@@ -3,7 +3,6 @@ from datetime import datetime, timezone
 import ccxt, pandas as pd
 from flask import Flask, jsonify
 
-# --- FIX: يقرأ كل أسماء المفاتيح القديمة والجديدة ---
 def get_env(*names):
     for n in names:
         v = os.getenv(n, "").strip()
@@ -16,7 +15,7 @@ CONFIG = {
     "TAKE_PROFIT": 0.018, "TAKE_PROFIT_2": 0.035, "STOP_LOSS": 0.009,
     "TRAILING_TRIGGER": 0.008, "TRAILING_STEP": 0.004,
     "FEE_RATE": 0.0005, "MIN_NET": 0.008, "MIN_SIGNAL_SCORE": 3,
-    "LIVE_TRADING": get_env("LIVE_TRADING","LIVE","TRADING").upper()=="YES" or True, # يجبر التداول الحي اذا فيه مفاتيح
+    "LIVE_TRADING": True,
     "ALLOW_SPOT": True, "ALLOW_FUTURES": True,
     "STATE_FILE": "bot_state.json", "MAX_SPOT_USD": 16.0, "MAX_FUTURES_USD": 6.0,
 }
@@ -25,22 +24,13 @@ API_KEY = get_env("OKX_API_KEY","OKX_KEY")
 API_SECRET = get_env("OKX_API_SECRET","OKX_SECRET_KEY","OKX_SECRET","SECRET")
 API_PASSWORD = get_env("OKX_API_PASSWORD","OKX_PASSPHRASE","PASSPHRASE","OKX_PASS")
 
-# لو ما فيه مفاتيح، LIVE يصير false تلقائيا
-if not API_KEY or not API_SECRET or not API_PASSWORD:
-    CONFIG["LIVE_TRADING"] = False
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log=logging.getLogger("DEATH_HUNTER")
 app=Flask(__name__)
 
-# ينشئ الاتصال فقط اذا فيه مفاتيح
-if API_SECRET:
-    exchange=ccxt.okx({"apiKey":API_KEY,"secret":API_SECRET,"password":API_PASSWORD,"enableRateLimit":True,"options":{"defaultType":"spot"}})
-else:
-    exchange=ccxt.okx({"enableRateLimit":True})
+exchange=ccxt.okx({"apiKey":API_KEY,"secret":API_SECRET,"password":API_PASSWORD,"enableRateLimit":True,"options":{"defaultType":"spot"}}) if API_SECRET else ccxt.okx({"enableRateLimit":True})
 
-state={"running":True,"started":datetime.now(timezone.utc).isoformat(),"last_scan":None,"scanned":0,"signals":[],"trades":[],"errors":[],"spot_position":None,"future_position":None,"wins":0,"losses":0,"pnl":0.0,"pnl_net":0.0,
-       "keys_found": {"api_key": bool(API_KEY), "secret": bool(API_SECRET), "password": bool(API_PASSWORD), "api_prefix": API_KEY[:8] if API_KEY else "none"}}
+state={"running":True,"started":datetime.now(timezone.utc).isoformat(),"last_scan":None,"scanned":0,"signals":[],"trades":[],"errors":[],"spot_position":None,"future_position":None,"wins":0,"losses":0,"pnl":0.0,"pnl_net":0.0,"keys_found":{"api_key":bool(API_KEY),"secret":bool(API_SECRET),"password":bool(API_PASSWORD),"api_prefix":API_KEY[:8] if API_KEY else "none"}}
 
 def save_state():
     try:
@@ -100,12 +90,8 @@ def analyze_market(symbol):
     except: return None
 
 def get_free_usdt():
-    try:
-        bal=exchange.fetch_balance()
-        return float(bal.get("USDT",{}).get("free",0) or 0)
-    except Exception as e:
-        record_error(f"Balance {e}")
-        return 0
+    try: bal=exchange.fetch_balance(); return float(bal.get("USDT",{}).get("free",0) or 0)
+    except Exception as e: record_error(f"Balance {e}"); return 0
 
 def get_contract_amount(symbol,margin,price):
     market=exchange.market(symbol); contract_size=float(market.get("contractSize") or 1); notional=margin*CONFIG["LEVERAGE"]
@@ -141,7 +127,6 @@ def place_spot_trade(signal):
     if budget<5: return
     price=signal["price"]; amount=float(exchange.amount_to_precision(signal["symbol"],budget/price))
     if amount*price>CONFIG["MAX_SPOT_USD"]: return
-    if not CONFIG["LIVE_TRADING"]: log.info(f"SIM SPOT BUY {signal['symbol']} {amount}"); return
     try:
         order=exchange.create_market_buy_order(signal["symbol"],amount); avg=float(order.get("average") or price); filled=float(order.get("filled") or amount); t=get_targets(avg,"long")
         state["spot_position"]={"symbol":signal["symbol"],"amount":filled,"entry":avg,"stop":t["sl"],"tp1":t["tp1"],"tp2":t["tp2"],"side":"long","opened":datetime.now(timezone.utc).isoformat()}; save_state()
@@ -161,17 +146,30 @@ def place_future_trade(signal):
     if margin<4: return
     price=signal["price"]; t=get_targets(price,signal["direction"])
     if not is_profitable(price,t["tp1"]): return
-    amount=get_contract_amount(swap,margin,price); side="buy" if signal["direction"]=="long" else "sell"
+    amount=get_contract_amount(swap,margin,price)
+    side="buy" if signal["direction"]=="long" else "sell"
+    posSide="long" if signal["direction"]=="long" else "short"
     try: exchange.set_leverage(CONFIG["LEVERAGE"],swap,{"mgnMode":"isolated"})
     except: pass
-    if not CONFIG["LIVE_TRADING"]: log.info(f"SIM FUT {side} {swap} {amount}"); return
     try:
-        order=exchange.create_order(swap,"market",side,amount,None,{"tdMode":"isolated","lever":str(CONFIG["LEVERAGE"])})
+        # المحاولة 1: مع posSide (لـ Hedge Mode)
+        order=exchange.create_order(swap,"market",side,amount,None,{"tdMode":"isolated","posSide":posSide,"lever":str(CONFIG["LEVERAGE"])})
         avg=float(order.get("average") or price); filled=float(order.get("filled") or amount); t_real=get_targets(avg,signal["direction"])
         state["future_position"]={"symbol":swap,"side":signal["direction"],"amount":filled,"entry":avg,"stop":t_real["sl"],"tp1":t_real["tp1"],"tp2":t_real["tp2"],"tp1_done":False,"opened":datetime.now(timezone.utc).isoformat()}
-        log.info(f"FUT OPEN {side} {swap} {filled} @ {avg}"); save_state()
+        log.info(f"FUT OPEN {side}/{posSide} {swap} {filled} @ {avg}"); save_state()
     except Exception as e:
-        if "50124" in str(e): CONFIG["ALLOW_FUTURES"]=False; record_error("Futures disabled - account not enabled")
+        err=str(e)
+        if "posSide" in err or "51000" in err:
+            try:
+                # المحاولة 2: بدون posSide (لـ One-Way Mode)
+                log.info(f"Retry futures without posSide for {swap}")
+                order=exchange.create_order(swap,"market",side,amount,None,{"tdMode":"isolated","lever":str(CONFIG["LEVERAGE"])})
+                avg=float(order.get("average") or price); filled=float(order.get("filled") or amount); t_real=get_targets(avg,signal["direction"])
+                state["future_position"]={"symbol":swap,"side":signal["direction"],"amount":filled,"entry":avg,"stop":t_real["sl"],"tp1":t_real["tp1"],"tp2":t_real["tp2"],"tp1_done":False,"opened":datetime.now(timezone.utc).isoformat()}
+                save_state()
+            except Exception as e2:
+                record_error(f"Future retry {e2}")
+        elif "50124" in err: CONFIG["ALLOW_FUTURES"]=False; record_error("Futures disabled - enable futures in OKX")
         else: record_error(f"Future {e}")
 
 def monitor_positions():
@@ -180,7 +178,7 @@ def monitor_positions():
         try:
             ticker=exchange.fetch_ticker(pos["symbol"]); price=float(ticker["last"]); update_trailing(pos,price)
             hit=price<=pos["stop"] or price>=pos["tp1"]
-            if hit and CONFIG["LIVE_TRADING"]:
+            if hit:
                 base=pos["symbol"].split("/")[0]; bal=exchange.fetch_balance(); avail=float(bal.get(base,{}).get("free",0) or 0)
                 amt=float(exchange.amount_to_precision(pos["symbol"],min(pos["amount"],avail)))
                 if amt>0:
@@ -202,7 +200,11 @@ def monitor_positions():
             tp1_hit=(price>=fpos["tp1"] if fpos["side"]=="long" else price<=fpos["tp1"])
             if tp1_hit and not fpos.get("tp1_done"):
                 half=float(exchange.amount_to_precision(fpos["symbol"],fpos["amount"]/2)); side_close="sell" if fpos["side"]=="long" else "buy"
-                if CONFIG["LIVE_TRADING"]: exchange.create_order(fpos["symbol"],"market",side_close,half,None,{"posSide":fpos["side"],"mgnMode":"isolated","reduceOnly":True})
+                posSide_close="long" if fpos["side"]=="long" else "short"
+                try:
+                    exchange.create_order(fpos["symbol"],"market",side_close,half,None,{"posSide":posSide_close,"mgnMode":"isolated","reduceOnly":True})
+                except:
+                    exchange.create_order(fpos["symbol"],"market",side_close,half,None,{"mgnMode":"isolated","reduceOnly":True})
                 fpos["stop"]=fpos["entry"]; fpos["tp1_done"]=True; fpos["amount"]-=half; save_state(); log.info(f"TP1 50% {fpos['symbol']}")
         except Exception as e: record_error(f"Fut mon {e}")
 
@@ -221,10 +223,10 @@ def scan_and_trade():
     save_state()
 
 def run_bot():
-    load_state(); log.info(f"V3001 KEYS OK {state['keys_found']} LIVE={CONFIG['LIVE_TRADING']}")
+    load_state(); log.info(f"V3002 START keys={state['keys_found']} balance will be fetched")
     while state["running"]:
         try:
-            if CONFIG["LIVE_TRADING"]: monitor_positions()
+            monitor_positions()
             scan_and_trade()
         except Exception as e: record_error(str(e))
         time.sleep(CONFIG["SCAN_INTERVAL"])
@@ -232,11 +234,11 @@ def run_bot():
 @app.route("/")
 def home(): 
     return jsonify({
-        "bot":"V3001 FIXED KEYS",
+        "bot":"V3002 FIXED posSide",
         "keys": state["keys_found"],
         "running":state["running"],
         "live":CONFIG["LIVE_TRADING"],
-        "balance_usdt": get_free_usdt() if API_SECRET else "no keys",
+        "balance_usdt": get_free_usdt(),
         "tp1":f"{CONFIG['TAKE_PROFIT']*100}%","tp2":f"{CONFIG['TAKE_PROFIT_2']*100}%","sl":f"{CONFIG['STOP_LOSS']*100}%","trailing":f"{CONFIG['TRAILING_TRIGGER']*100}%/{CONFIG['TRAILING_STEP']*100}%",
         "scanned":state["scanned"],"last_scan":state["last_scan"],"signals":state["signals"],"spot_pos":state["spot_position"],"future_pos":state["future_position"],
         "wins":state["wins"],"losses":state["losses"],"pnl":round(state["pnl"],4),"pnl_net":round(state["pnl_net"],4),"errors":state["errors"][-5:]
