@@ -27,12 +27,120 @@ def load_soul():
                 return json.load(f)
     except:
         pass
-    return {"trades": [], "version": VERSION}
+    return {"trades": [], "version": VERSION, "active": active_trade}
 
 def save_soul(s):
     try:
         with open(SOUL_FILE, "w", encoding="utf-8") as f:
             json.dump(s, f, ensure_ascii=False, indent=2)
+    except:
+        pass
+
+def get_ticker(inst):
+    try:
+        url = f"https://www.okx.com/api/v5/market/ticker?instId={inst.replace('/','-')}"
+        r = requests.get(url, timeout=10).json()
+        data = r["data"][0]
+        last = float(data["last"])
+        open24 = float(data.get("open24h", last))
+        change = ((last - open24) / open24 * 100) if open24 else 0
+        return last, change
+    except:
+        return None, 0
+
+def trading_loop():
+    global active_trade
+    soul = load_soul()
+    if soul.get("active") and soul["active"]["coin"]:
+        active_trade = soul["active"]
+    
+    while True:
+        try:
+            # تحديث كل العملات
+            for coin in COINS:
+                price, change = get_ticker(coin)
+                if price:
+                    SCORES[coin] = {
+                        "price": price,
+                        "change": round(change, 2),
+                        "score": int(50 + change * 8),
+                        "updated": datetime.now().strftime("%H:%M:%S")
+                    }
+            
+            # اختيار افضل عملة
+            if SCORES:
+                best_coin, best_data = max(SCORES.items(), key=lambda x: x[1]["score"])
+                
+                # اذا ما عندنا صفقة
+                if active_trade["coin"] is None:
+                    active_trade = {
+                        "coin": best_coin,
+                        "entry": best_data["price"],
+                        "highest": best_data["price"],
+                        "stop_loss": best_data["price"] * 0.95,
+                        "profit_locked": 0
+                    }
+                    soul["active"] = active_trade
+                    save_soul(soul)
+                else:
+                    # متابعة الصفقة الحالية
+                    curr = SCORES.get(active_trade["coin"])
+                    if curr:
+                        price = curr["price"]
+                        # تحديث اعلى سعر
+                        if price > active_trade["highest"]:
+                            active_trade["highest"] = price
+                        
+                        hp = (active_trade["highest"] / active_trade["entry"] - 1) * 100
+                        
+                        # نظام الرفع التدريجي للـ 100X
+                        if hp >= 100:
+                            active_trade["stop_loss"] = active_trade["entry"] * 1.80
+                            active_trade["profit_locked"] = 80
+                        elif hp >= 50:
+                            active_trade["stop_loss"] = active_trade["entry"] * 1.40
+                            active_trade["profit_locked"] = 40
+                        elif hp >= 30:
+                            active_trade["stop_loss"] = active_trade["entry"] * 1.25
+                            active_trade["profit_locked"] = 25
+                        elif hp >= 20:
+                            active_trade["stop_loss"] = active_trade["entry"] * 1.15
+                            active_trade["profit_locked"] = 15
+                        elif hp >= 10:
+                            active_trade["stop_loss"] = active_trade["entry"] * 1.07
+                            active_trade["profit_locked"] = 7
+                        elif hp >= 5:
+                            active_trade["stop_loss"] = active_trade["entry"] * 1.02
+                            active_trade["profit_locked"] = 2
+                        elif hp >= 2:
+                            if active_trade["stop_loss"] < active_trade["entry"]:
+                                active_trade["stop_loss"] = active_trade["entry"]
+                        
+                        soul["active"] = active_trade
+                        save_soul(soul)
+            
+            time.sleep(60)
+        except Exception as e:
+            print(f"Error: {e}")
+            time.sleep(10)
+
+@app.route("/")
+def home():
+    html = f"<h2>{VERSION}</h2><h3>Active: {active_trade['coin']} | Entry: {active_trade['entry']} | Highest: {active_trade['highest']} | Locked: {active_trade['profit_locked']}%</h3><hr>"
+    for c, d in sorted(SCORES.items(), key=lambda x: x[1]['score'], reverse=True):
+        active_mark = " <-- ACTIVE" if c == active_trade['coin'] else ""
+        html += f"{c}: {d['price']} | {d['change']}% | Score {d['score']}{active_mark}<br>"
+    return html
+
+@app.route("/health")
+def health():
+    return "100X WORKING", 200
+
+# تشغيل البوت في الخلفية
+threading.Thread(target=trading_loop, daemon=True).start()
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))False, indent=2)
     except:
         pass
 
