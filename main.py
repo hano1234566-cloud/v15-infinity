@@ -1,4 +1,4 @@
-# V1000 LEGENDARY - FINAL - ALL COINS REAL + DASHBOARD
+# V1000 FINAL - ALL COINS + OLD ORDERS MANAGER + CLEAN DASHBOARD
 import os, time, threading
 from flask import Flask
 import ccxt
@@ -10,7 +10,7 @@ PASSPHRASE = os.getenv("OKX_PASSPHRASE", "").strip()
 app = Flask(__name__)
 LOGS = []
 
-def log(m, typ="info"):
+def log(m):
     t = time.strftime("%H:%M:%S")
     msg = f"{t} {m}"
     LOGS.append(msg)
@@ -34,6 +34,7 @@ class V1000_Spot_All:
         self.banned = {}
         self.last_scan = 0
         self.last_found = 0
+        self.last_warn = 0
     def run(self):
         ex = make_client('spot')
         log("[SPOT] 🚀 شغال - يفحص جميع عملات السبوت")
@@ -54,37 +55,36 @@ class V1000_Spot_All:
                 self.last_found = len(cands)
                 
                 if cands:
-                    log(f"[SPOT] 🔍 {len(tickers)} عملة | {len(cands)} نازلة -5% | أقوى: {cands[0][0]} {cands[0][1]:.1f}%")
+                    log(f"[SPOT] 🔍 {len(tickers)} | {len(cands)} نازلة | أقوى: {cands[0][0]} {cands[0][1]:.1f}%")
                 else:
-                    log(f"[SPOT] 🔍 {len(tickers)} عملة | لا يوجد -5% الآن")
+                    log(f"[SPOT] 🔍 {len(tickers)} | لا يوجد -5% الآن")
 
                 if cands and self.positions < self.max_positions:
                     sym, ch, vol, last = cands[0]
-                    # شيك الرصيد قبل الشراء
                     bal = ex.fetch_balance()
                     usdt = bal.get('USDT',{}).get('free',0)
                     if usdt < 0.9:
-                        log(f"[SPOT] ⚠️ رصيدك ناقص ${usdt:.2f} - اشحن USDT في Funding", "warn")
-                    else:
-                        qty = self.amount_usd / last
-                        try:
-                            ex.create_market_buy_order(sym, qty)
-                            log(f"[SPOT REAL] ✅ اشتريت {sym} {ch:.1f}% بـ 1$ عند {last}", "ok")
-                            self.positions += 1
-                            self.banned[sym] = time.time() + 3600
-                            threading.Timer(3600, lambda: setattr(self, 'positions', max(0, self.positions-1))).start()
-                        except Exception as e:
-                            if "insufficient" in str(e).lower():
-                                log(f"[SPOT] ❌ رصيد ناقص - اشحن USDT", "err")
-                            else:
-                                log(f"[SPOT ERR] {sym} {str(e)[:100]}", "err")
+                        if time.time() - self.last_warn > 600:
+                            log(f"[SPOT] ⏸️ متوقف - رصيدك ${usdt:.2f} - ينتظر ربح من أوامرك القديمة - لاقي {sym} {ch:.1f}%")
+                            self.last_warn = time.time()
+                        time.sleep(30)
+                        continue
+                    qty = self.amount_usd / last
+                    try:
+                        ex.create_market_buy_order(sym, qty)
+                        log(f"[SPOT REAL] ✅ اشتريت {sym} {ch:.1f}% بـ 1$ عند {last}")
+                        self.positions += 1
+                        self.banned[sym] = time.time() + 3600
+                        threading.Timer(3600, lambda: setattr(self, 'positions', max(0, self.positions-1))).start()
+                    except Exception as e:
+                        log(f"[SPOT ERR] {sym} {str(e)[:100]}")
                 
                 now = time.time()
                 for k in list(self.banned.keys()):
                     if self.banned[k] < now: del self.banned[k]
                 time.sleep(15)
             except Exception as e:
-                log(f"[SPOT ERR] {str(e)[:120]}", "err"); time.sleep(10)
+                log(f"[SPOT ERR] {str(e)[:120]}"); time.sleep(10)
 
 class V1000_Future_All:
     def __init__(self):
@@ -116,27 +116,52 @@ class V1000_Future_All:
                 self.last_found = len(cands)
                 if cands:
                     log(f"[FUTURE] 🔍 {len(tickers)} | {len(cands)} نازلة | أقوى: {cands[0][0]} {cands[0][1]:.1f}%")
-
-                if cands and self.positions < self.max_positions:
-                    sym, ch, vol, last = cands[0]
-                    try:
-                        ex.set_leverage(3, sym)
-                        qty = (self.amount_usd * 3) / last
-                        ex.create_market_buy_order(sym, qty)
-                        log(f"[FUTURE REAL] ✅ دخول {sym} {ch:.1f}% بـ 1$ 3X عند {last}", "ok")
-                        self.positions = 1
-                        self.banned[sym] = time.time() + 1800
-                        threading.Timer(300, lambda: setattr(self, 'positions', 0)).start()
-                    except Exception as e:
-                        log(f"[FUTURE ERR] {sym} {str(e)[:100]}", "err")
                 time.sleep(10)
             except Exception as e:
-                log(f"[FUTURE ERR] {str(e)[:120]}", "err"); time.sleep(5)
+                log(f"[FUTURE ERR] {str(e)[:120]}"); time.sleep(5)
+
+class Manager_Old_Orders:
+    def __init__(self):
+        self.holdings_text = "جاري الفحص..."
+    def run(self):
+        ex = make_client('spot')
+        log("[MANAGER] 🧠 شغال - يراقب أوامرك المفتوحة من قبل")
+        while True:
+            try:
+                bal = ex.fetch_balance()
+                holdings = []
+                for coin in bal['total']:
+                    if coin == 'USDT': continue
+                    total = bal['total'].get(coin,0)
+                    if not total or total == 0: continue
+                    try:
+                        ticker = ex.fetch_ticker(f"{coin}/USDT")
+                        price = ticker['last']
+                        value = total * price
+                        if value > 0.05:
+                            change = ticker.get('percentage') or 0
+                            holdings.append(f"{coin}: {total:.4f} (${value:.2f}) {change:+.1f}%")
+                            # لو تبغاه يبيع اوتوماتيك اذا ربح +2% شيل # من السطرين الجايين
+                            # if change >= 2.0 and value > 0.5:
+                            #     ex.create_market_sell_order(f"{coin}/USDT", total)
+                            #     log(f"[MANAGER SELL] ✅ باع {coin} ربح {change:.1f}% ${value:.2f}")
+                    except: pass
+                if holdings:
+                    self.holdings_text = " | ".join(holdings)
+                    log(f"[MANAGER] 📦 عندك: {self.holdings_text}")
+                else:
+                    self.holdings_text = "ما عندك عملات قديمة"
+                time.sleep(30)
+            except Exception as e:
+                log(f"[MANAGER ERR] {str(e)[:100]}"); time.sleep(15)
 
 spot_bot = V1000_Spot_All()
 future_bot = V1000_Future_All()
+manager_bot = Manager_Old_Orders()
+
 threading.Thread(target=spot_bot.run, daemon=True).start()
 threading.Thread(target=future_bot.run, daemon=True).start()
+threading.Thread(target=manager_bot.run, daemon=True).start()
 
 @app.route('/')
 def index():
@@ -148,11 +173,11 @@ def index():
         usdt_spot = 0
 
     logs_html = ""
-    for l in LOGS[-100:][::-1]:
+    for l in LOGS[-120:][::-1]:
         cls = "log-line"
-        if "REAL" in l and "✅" in l: cls += " ok"
-        elif "ERR" in l or "❌" in l or "insufficient" in l: cls += " err"
-        elif "⚠️" in l or "ناقص" in l: cls += " warn"
+        if "REAL" in l or "SELL" in l: cls += " ok"
+        elif "ERR" in l: cls += " err"
+        elif "⏸️" in l or "MANAGER" in l: cls += " warn"
         logs_html += f"<div class='{cls}'>{l}</div>"
 
     return f"""
@@ -171,24 +196,26 @@ def index():
     .status{{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:12px}}
     .pill{{background:#121827;border-radius:12px;padding:10px;text-align:center;border:1px solid #1e2a44}}
     .pill b{{display:block;font-size:12px}} .pill span{{font-size:10px;color:#8a9bb8}}
+    .old{{background:#121827;border:1px solid #1e2a44;border-radius:12px;padding:10px;margin-bottom:12px;font-size:11px}}
     .dot{{width:8px;height:8px;background:#00ff88;border-radius:50%;display:inline-block;animation:blink 1s infinite}}
     @keyframes blink{{50%{{opacity:0.2}}}}
-    .logs{{background:#0b1120;border:1px solid #1e2a44;border-radius:14px;padding:6px;height:500px;overflow-y:auto}}
+    .logs{{background:#0b1120;border:1px solid #1e2a44;border-radius:14px;padding:6px;height:520px;overflow-y:auto}}
     .log-line{{font-size:11px;padding:7px 8px;border-bottom:1px solid #141d31;font-family:monospace;word-break:break-all}}
-    .err{{color:#ff5a5a;background:#1a0f14}} .ok{{color:#00ff88;background:#0f1a14}} .warn{{color:#ffaa00}}
+    .err{{color:#ff5a5a}} .ok{{color:#00ff88;background:#0f1a14}} .warn{{color:#ffaa00}}
     </style></head>
     <body>
     <div class="header">
-        <h1>🔥 V1000 ALL COINS DASHBOARD 🔥</h1>
-        <p><span class="dot"></span> LIVE REAL 1$ - SPOT + FUTURE - شغال مثل الحلاوة</p>
+        <h1>🔥 V1000 ALL COINS + OLD ORDERS 🔥</h1>
+        <p><span class="dot"></span> LIVE - يراقب الجديد والقديم - شغال مثل الحلاوة</p>
     </div>
     <div class="grid">
-        <div class="card"><h3>USDT SPOT BALANCE</h3><div class="val">${usdt_spot:.2f}</div><div class="sub">{'✅ جاهز للشراء' if usdt_spot>=1 else '❌ اشحن USDT في Funding'}</div></div>
-        <div class="card"><h3>SPOT SCAN</h3><div class="val">{spot_bot.last_scan} / {spot_bot.last_found}</div><div class="sub">فحص / لقى نازلة -5%</div></div>
+        <div class="card"><h3>USDT BALANCE</h3><div class="val">${usdt_spot:.2f}</div><div class="sub">{'✅ جاهز' if usdt_spot>=1 else '⏸️ ينتظر ربح من القديم'}</div></div>
+        <div class="card"><h3>SPOT SCAN</h3><div class="val">{spot_bot.last_scan}/{spot_bot.last_found}</div><div class="sub">فحص / لقى نازلة -5%</div></div>
     </div>
+    <div class="old"><b>📦 أوامرك المفتوحة من قبل:</b><br>{manager_bot.holdings_text}</div>
     <div class="status">
-        <div class="pill"><b>SPOT: {spot_bot.positions}/{spot_bot.max_positions}</b><span>كل عملات USDT نازلة -5% = شراء 1$</span></div>
-        <div class="pill"><b>FUTURE: {future_bot.positions}/{future_bot.max_positions}</b><span>كل عملات USDT:USDT نازلة -5% = 1$ 3X</span></div>
+        <div class="pill"><b>SPOT: {spot_bot.positions}/{spot_bot.max_positions}</b><span>كل عملات USDT نازلة -5% = 1$</span></div>
+        <div class="pill"><b>FUTURE: {future_bot.positions}/{future_bot.max_positions}</b><span>كل عملات USDT:USDT نازلة -5%</span></div>
     </div>
     <div class="logs">{logs_html}</div>
     </body></html>
