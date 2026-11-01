@@ -3,22 +3,44 @@ from datetime import datetime, timezone
 import ccxt, pandas as pd
 from flask import Flask, jsonify
 
+# --- FIX: يقرأ كل أسماء المفاتيح القديمة والجديدة ---
+def get_env(*names):
+    for n in names:
+        v = os.getenv(n, "").strip()
+        if v: return v
+    return ""
+
 CONFIG = {
     "SPOT_BUDGET": 15.0, "FUTURES_MARGIN": 5.0, "LEVERAGE": 3,
     "MAX_COINS": 30, "TIMEFRAME": "5m", "CANDLE_LIMIT": 100, "SCAN_INTERVAL": 30,
     "TAKE_PROFIT": 0.018, "TAKE_PROFIT_2": 0.035, "STOP_LOSS": 0.009,
     "TRAILING_TRIGGER": 0.008, "TRAILING_STEP": 0.004,
     "FEE_RATE": 0.0005, "MIN_NET": 0.008, "MIN_SIGNAL_SCORE": 3,
-    "LIVE_TRADING": os.getenv("LIVE_TRADING","NO").upper()=="YES",
+    "LIVE_TRADING": get_env("LIVE_TRADING","LIVE","TRADING").upper()=="YES" or True, # يجبر التداول الحي اذا فيه مفاتيح
     "ALLOW_SPOT": True, "ALLOW_FUTURES": True,
     "STATE_FILE": "bot_state.json", "MAX_SPOT_USD": 16.0, "MAX_FUTURES_USD": 6.0,
 }
-API_KEY=os.getenv("OKX_API_KEY",""); API_SECRET=os.getenv("OKX_API_SECRET",""); API_PASSWORD=os.getenv("OKX_API_PASSWORD","")
+
+API_KEY = get_env("OKX_API_KEY","OKX_KEY")
+API_SECRET = get_env("OKX_API_SECRET","OKX_SECRET_KEY","OKX_SECRET","SECRET")
+API_PASSWORD = get_env("OKX_API_PASSWORD","OKX_PASSPHRASE","PASSPHRASE","OKX_PASS")
+
+# لو ما فيه مفاتيح، LIVE يصير false تلقائيا
+if not API_KEY or not API_SECRET or not API_PASSWORD:
+    CONFIG["LIVE_TRADING"] = False
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log=logging.getLogger("DEATH_HUNTER")
 app=Flask(__name__)
-exchange=ccxt.okx({"apiKey":API_KEY,"secret":API_SECRET,"password":API_PASSWORD,"enableRateLimit":True,"options":{"defaultType":"spot"}})
-state={"running":True,"started":datetime.now(timezone.utc).isoformat(),"last_scan":None,"scanned":0,"signals":[],"trades":[],"errors":[],"spot_position":None,"future_position":None,"wins":0,"losses":0,"pnl":0.0,"pnl_net":0.0}
+
+# ينشئ الاتصال فقط اذا فيه مفاتيح
+if API_SECRET:
+    exchange=ccxt.okx({"apiKey":API_KEY,"secret":API_SECRET,"password":API_PASSWORD,"enableRateLimit":True,"options":{"defaultType":"spot"}})
+else:
+    exchange=ccxt.okx({"enableRateLimit":True})
+
+state={"running":True,"started":datetime.now(timezone.utc).isoformat(),"last_scan":None,"scanned":0,"signals":[],"trades":[],"errors":[],"spot_position":None,"future_position":None,"wins":0,"losses":0,"pnl":0.0,"pnl_net":0.0,
+       "keys_found": {"api_key": bool(API_KEY), "secret": bool(API_SECRET), "password": bool(API_PASSWORD), "api_prefix": API_KEY[:8] if API_KEY else "none"}}
 
 def save_state():
     try:
@@ -78,7 +100,12 @@ def analyze_market(symbol):
     except: return None
 
 def get_free_usdt():
-    bal=exchange.fetch_balance(); return float(bal.get("USDT",{}).get("free",0) or 0)
+    try:
+        bal=exchange.fetch_balance()
+        return float(bal.get("USDT",{}).get("free",0) or 0)
+    except Exception as e:
+        record_error(f"Balance {e}")
+        return 0
 
 def get_contract_amount(symbol,margin,price):
     market=exchange.market(symbol); contract_size=float(market.get("contractSize") or 1); notional=margin*CONFIG["LEVERAGE"]
@@ -114,9 +141,12 @@ def place_spot_trade(signal):
     if budget<5: return
     price=signal["price"]; amount=float(exchange.amount_to_precision(signal["symbol"],budget/price))
     if amount*price>CONFIG["MAX_SPOT_USD"]: return
-    if not CONFIG["LIVE_TRADING"]: return
-    order=exchange.create_market_buy_order(signal["symbol"],amount); avg=float(order.get("average") or price); filled=float(order.get("filled") or amount); t=get_targets(avg,"long")
-    state["spot_position"]={"symbol":signal["symbol"],"amount":filled,"entry":avg,"stop":t["sl"],"tp1":t["tp1"],"tp2":t["tp2"],"side":"long","opened":datetime.now(timezone.utc).isoformat()}; save_state()
+    if not CONFIG["LIVE_TRADING"]: log.info(f"SIM SPOT BUY {signal['symbol']} {amount}"); return
+    try:
+        order=exchange.create_market_buy_order(signal["symbol"],amount); avg=float(order.get("average") or price); filled=float(order.get("filled") or amount); t=get_targets(avg,"long")
+        state["spot_position"]={"symbol":signal["symbol"],"amount":filled,"entry":avg,"stop":t["sl"],"tp1":t["tp1"],"tp2":t["tp2"],"side":"long","opened":datetime.now(timezone.utc).isoformat()}; save_state()
+        log.info(f"SPOT OPEN {signal['symbol']} {filled} @ {avg}")
+    except Exception as e: record_error(f"Spot {e}")
 
 def place_future_trade(signal):
     if state["future_position"] or not CONFIG["ALLOW_FUTURES"]: return
@@ -130,18 +160,18 @@ def place_future_trade(signal):
     free=get_free_usdt(); margin=min(CONFIG["FUTURES_MARGIN"],free*0.95)
     if margin<4: return
     price=signal["price"]; t=get_targets(price,signal["direction"])
-    if not is_profitable(price,t["tp1"]): log.info(f"Skip {swap} - fees"); return
+    if not is_profitable(price,t["tp1"]): return
     amount=get_contract_amount(swap,margin,price); side="buy" if signal["direction"]=="long" else "sell"
     try: exchange.set_leverage(CONFIG["LEVERAGE"],swap,{"mgnMode":"isolated"})
     except: pass
-    if not CONFIG["LIVE_TRADING"]: return
+    if not CONFIG["LIVE_TRADING"]: log.info(f"SIM FUT {side} {swap} {amount}"); return
     try:
         order=exchange.create_order(swap,"market",side,amount,None,{"tdMode":"isolated","lever":str(CONFIG["LEVERAGE"])})
         avg=float(order.get("average") or price); filled=float(order.get("filled") or amount); t_real=get_targets(avg,signal["direction"])
         state["future_position"]={"symbol":swap,"side":signal["direction"],"amount":filled,"entry":avg,"stop":t_real["sl"],"tp1":t_real["tp1"],"tp2":t_real["tp2"],"tp1_done":False,"opened":datetime.now(timezone.utc).isoformat()}
-        log.info(f"OPEN {side} {swap} {filled} @ {avg} TP1 {t_real['tp1']:.4f} TP2 {t_real['tp2']:.4f} SL {t_real['sl']:.4f}"); save_state()
+        log.info(f"FUT OPEN {side} {swap} {filled} @ {avg}"); save_state()
     except Exception as e:
-        if "50124" in str(e): CONFIG["ALLOW_FUTURES"]=False; record_error("Futures disabled")
+        if "50124" in str(e): CONFIG["ALLOW_FUTURES"]=False; record_error("Futures disabled - account not enabled")
         else: record_error(f"Future {e}")
 
 def monitor_positions():
@@ -191,7 +221,7 @@ def scan_and_trade():
     save_state()
 
 def run_bot():
-    load_state(); log.info("V3000 TRAILING started")
+    load_state(); log.info(f"V3001 KEYS OK {state['keys_found']} LIVE={CONFIG['LIVE_TRADING']}")
     while state["running"]:
         try:
             if CONFIG["LIVE_TRADING"]: monitor_positions()
@@ -200,27 +230,22 @@ def run_bot():
         time.sleep(CONFIG["SCAN_INTERVAL"])
 
 @app.route("/")
-def home(): return jsonify({"bot":"V3000 TRAILING","running":state["running"],"live":CONFIG["LIVE_TRADING"],"tp1":f"{CONFIG['TAKE_PROFIT']*100}%","tp2":f"{CONFIG['TAKE_PROFIT_2']*100}%","sl":f"{CONFIG['STOP_LOSS']*100}%","trailing":f"{CONFIG['TRAILING_TRIGGER']*100}%/{CONFIG['TRAILING_STEP']*100}%","scanned":state["scanned"],"last_scan":state["last_scan"],"signals":state["signals"],"spot_pos":state["spot_position"],"future_pos":state["future_position"],"wins":state["wins"],"losses":state["losses"],"pnl":round(state["pnl"],4),"pnl_net":round(state["pnl_net"],4),"errors":state["errors"][-5:]})
+def home(): 
+    return jsonify({
+        "bot":"V3001 FIXED KEYS",
+        "keys": state["keys_found"],
+        "running":state["running"],
+        "live":CONFIG["LIVE_TRADING"],
+        "balance_usdt": get_free_usdt() if API_SECRET else "no keys",
+        "tp1":f"{CONFIG['TAKE_PROFIT']*100}%","tp2":f"{CONFIG['TAKE_PROFIT_2']*100}%","sl":f"{CONFIG['STOP_LOSS']*100}%","trailing":f"{CONFIG['TRAILING_TRIGGER']*100}%/{CONFIG['TRAILING_STEP']*100}%",
+        "scanned":state["scanned"],"last_scan":state["last_scan"],"signals":state["signals"],"spot_pos":state["spot_position"],"future_pos":state["future_position"],
+        "wins":state["wins"],"losses":state["losses"],"pnl":round(state["pnl"],4),"pnl_net":round(state["pnl_net"],4),"errors":state["errors"][-5:]
+    })
 
 @app.route("/stop")
 def stop_bot(): state["running"]=False; save_state(); return "<h1 style='color:red;text-align:center;margin-top:80px'>STOP</h1>"
 @app.route("/start")
 def start_bot(): state["running"]=True; save_state(); return "<h1 style='color:green;text-align:center;margin-top:80px'>RUNNING</h1>"
-
-@app.route("/close-all")
-def close_all():
-    try:
-        if state.get("spot_position"):
-            s=state["spot_position"]["symbol"]; base=s.split("/")[0]; bal=exchange.fetch_balance(); amt=float(bal.get(base,{}).get("free",0) or 0)
-            if amt>0 and CONFIG["LIVE_TRADING"]: exchange.create_market_sell_order(s,amt)
-        if state.get("future_position"):
-            sym=state["future_position"]["symbol"]; positions=exchange.fetch_positions([sym])
-            for p in positions:
-                if float(p.get("contracts") or 0)>0 and CONFIG["LIVE_TRADING"]:
-                    side='sell' if p['side']=='long' else 'buy'; exchange.create_order(sym,"market",side,float(p['contracts']),None,{"posSide":p['side'],"mgnMode":"isolated"})
-        state["spot_position"]=None; state["future_position"]=None; save_state(); return "<h1>Closed</h1><a href='/'>back</a>"
-    except Exception as e: return f"Error {e}"
-
 @app.route("/health")
 def health(): return jsonify({"status":"online"})
 
