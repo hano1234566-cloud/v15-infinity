@@ -1,132 +1,667 @@
-import os, time, threading, ccxt
-from flask import Flask
 
-API_KEY = os.getenv("OKX_API_KEY","").strip()
-SECRET = (os.getenv("OKX_SECRET_KEY","") or os.getenv("OKX_SECRET","")).strip()
-PASSPHRASE = os.getenv("OKX_PASSPHRASE","").strip()
+import os
+import time
+import json
+import logging
+from datetime import datetime, timezone
 
-BAL=21.04; LIQ=0; TRADES=3; PNLS=0.006; WINS=0; LOSSES=0
-LAST="V20009 SMART TP/SL جاهز"
-RUN=True
+import ccxt
+import pandas as pd
+from flask import Flask, jsonify
+
+# =========================================================
+# DEATH HUNTER V30000 - OKX MULTI COIN TRADING BOT
+# Spot: 15 USDT | Futures: 5 USDT | Leverage: 3x
+# =========================================================
+
+CONFIG = {
+    "SPOT_BUDGET": 15.0,
+    "FUTURES_MARGIN": 5.0,
+    "LEVERAGE": 3,
+    "MAX_COINS": 30,
+    "TIMEFRAME": "5m",
+    "CANDLE_LIMIT": 100,
+    "SCAN_INTERVAL": 30,
+    "STOP_LOSS": 0.012,
+    "TAKE_PROFIT": 0.024,
+    "MIN_SIGNAL_SCORE": 3,
+    "LIVE_TRADING": os.getenv("LIVE_TRADING", "NO").upper() == "YES",
+    "ALLOW_SPOT": True,
+    "ALLOW_FUTURES": True,
+    "STATE_FILE": "bot_state.json",
+}
+
+API_KEY = os.getenv("OKX_API_KEY", "")
+API_SECRET = os.getenv("OKX_API_SECRET", "")
+API_PASSWORD = os.getenv("OKX_API_PASSWORD", "")
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+log = logging.getLogger("DEATH_HUNTER")
 
 app = Flask(__name__)
 
-def get_ex():
-    return ccxt.okx({'apiKey':API_KEY,'secret':SECRET,'password':PASSPHRASE,'enableRateLimit':True})
+exchange = ccxt.okx({
+    "apiKey": API_KEY,
+    "secret": API_SECRET,
+    "password": API_PASSWORD,
+    "enableRateLimit": True,
+    "options": {
+        "defaultType": "spot",
+    },
+})
 
-def hunter_smart():
-    global BAL, LIQ, TRADES, PNLS, LAST, WINS, LOSSES
-    while RUN:
+state = {
+    "running": True,
+    "started": datetime.now(timezone.utc).isoformat(),
+    "last_scan": None,
+    "scanned": 0,
+    "signals": [],
+    "trades": [],
+    "errors": [],
+    "spot_position": None,
+    "future_position": None,
+    "wins": 0,
+    "losses": 0,
+    "pnl": 0.0,
+}
+
+
+def save_state():
+    try:
+        with open(CONFIG["STATE_FILE"], "w") as f:
+            json.dump(state, f, indent=2)
+    except Exception as e:
+        log.error("State save error: %s", e)
+
+
+def load_state():
+    global state
+    try:
+        with open(CONFIG["STATE_FILE"], "r") as f:
+            saved = json.load(f)
+            state.update(saved)
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        log.error("State load error: %s", e)
+
+
+def record_error(message):
+    log.error(message)
+    state["errors"].append({
+        "time": datetime.now(timezone.utc).isoformat(),
+        "message": str(message),
+    })
+    state["errors"] = state["errors"][-30:]
+    save_state()
+
+
+def initialize():
+    if not CONFIG["LIVE_TRADING"]:
+        log.warning("LIVE_TRADING is disabled. No real orders will be sent.")
+    if not all([API_KEY, API_SECRET, API_PASSWORD]):
+        log.warning("OKX API credentials are not configured.")
+
+
+def get_market_symbols():
+    markets = exchange.load_markets()
+    tickers = exchange.fetch_tickers()
+
+    candidates = []
+
+    for symbol, market in markets.items():
         try:
-            ex = get_ex()
-            b = ex.fetch_balance()
-            BAL = float(b.get('USDT',{}).get('free',0) or BAL)
-            
-            if BAL < 5: LAST="رصيد قليل"; time.sleep(60); continue
+            if not market.get("active"):
+                continue
+            if not market.get("spot"):
+                continue
+            if market.get("quote") != "USDT":
+                continue
+            if market.get("base") in ("USDC", "USDT", "DAI", "FDUSD"):
+                continue
 
-            try:
-                # رافعة
-                try:
-                    ex.private_post_account_set_leverage({
-                        'instId':'AVAX-USDT-SWAP','lever':'3','mgnMode':'isolated','posSide':'long'
-                    })
-                except: pass
+            ticker = tickers.get(symbol, {})
+            volume = ticker.get("quoteVolume")
 
-                ticker = ex.fetch_ticker('AVAX/USDT:USDT')
-                price = ticker['last']
-                
-                # شرط دخول - فقط اذا نازل -1% (يصيد ارتداد)
-                # عشان ما يدخل طول الوقت
-                # نشتري لما ينزل
-                
-                LAST=f"يراقب AVAX @ ${price:.2f} | BAL ${BAL:.2f} | Win:{WINS} Loss:{LOSSES}"
-                
-                # دخول
-                ex.private_post_trade_order({
-                    'instId':'AVAX-USDT-SWAP','tdMode':'isolated',
-                    'side':'buy','posSide':'long','ordType':'market','sz':'1.5'
-                })
-                entry = price
-                TRADES+=1
-                LAST=f"✅ دخل LONG 1.5 @ ${entry:.3f} | Trade#{TRADES}"
-                
-                # مراقبة TP 1.2% و SL 0.7%
-                tp_price = entry * 1.012
-                sl_price = entry * 0.993
-                
-                for i in range(60): # يراقب 60 ثانية
-                    time.sleep(1)
-                    curr = ex.fetch_ticker('AVAX/USDT:USDT')['last']
-                    pnl_pct = (curr - entry)/entry*100*3 # مع الرافعة
-                    
-                    if curr >= tp_price:
-                        ex.private_post_trade_order({
-                            'instId':'AVAX-USDT-SWAP','tdMode':'isolated',
-                            'side':'sell','posSide':'long','ordType':'market','sz':'1.5'
-                        })
-                        profit = (curr - entry) * 1.5
-                        PNLS+=profit; WINS+=1
-                        LAST=f"💰 TP ربح +{pnl_pct:.2f}% | ${curr:.3f} | ربح ${profit:.4f} | الكلي ${PNLS:.4f}"
-                        break
-                    elif curr <= sl_price:
-                        ex.private_post_trade_order({
-                            'instId':'AVAX-USDT-SWAP','tdMode':'isolated',
-                            'side':'sell','posSide':'long','ordType':'market','sz':'1.5'
-                        })
-                        loss = (curr - entry) * 1.5
-                        PNLS+=loss; LOSSES+=1
-                        LAST=f"🔻 SL خسارة {pnl_pct:.2f}% | ${curr:.3f} | الكلي ${PNLS:.4f}"
-                        break
-                    
-                    if i==59: # وقت انتهى - سكر
-                        ex.private_post_trade_order({
-                            'instId':'AVAX-USDT-SWAP','tdMode':'isolated',
-                            'side':'sell','posSide':'long','ordType':'market','sz':'1.5'
-                        })
-                        profit = (curr - entry) * 1.5
-                        PNLS+=profit
-                        if profit>0: WINS+=1
-                        else: LOSSES+=1
-                        LAST=f"⏱ انتهى الوقت {pnl_pct:.2f}% | ${curr:.3f} | الكلي ${PNLS:.4f}"
+            if volume is None:
+                continue
 
-                time.sleep(5)
+            volume = float(volume)
 
-            except Exception as e:
-                LAST=f"انتظار: {str(e)[:90]}"; time.sleep(20)
+            if volume < 1_000_000:
+                continue
+
+            candidates.append((symbol, volume))
+
+        except Exception:
+            continue
+
+    candidates.sort(key=lambda x: x[1], reverse=True)
+    return [x[0] for x in candidates[:CONFIG["MAX_COINS"]]]
+
+
+def get_swap_symbol(spot_symbol):
+    base = spot_symbol.split("/")[0]
+    symbol = base + "/USDT:USDT"
+
+    markets = exchange.markets
+
+    if symbol not in markets:
+        return None
+
+    market = markets[symbol]
+
+    if not market.get("swap") or not market.get("active"):
+        return None
+
+    return symbol
+
+
+def fetch_candles(symbol):
+    candles = exchange.fetch_ohlcv(
+        symbol,
+        timeframe=CONFIG["TIMEFRAME"],
+        limit=CONFIG["CANDLE_LIMIT"],
+    )
+
+    df = pd.DataFrame(
+        candles,
+        columns=["time", "open", "high", "low", "close", "volume"]
+    )
+
+    if len(df) < 30:
+        return None
+
+    # Ignore the currently forming candle
+    df = df.iloc[:-1].copy()
+
+    df["ema9"] = df["close"].ewm(span=9).mean()
+    df["ema21"] = df["close"].ewm(span=21).mean()
+
+    delta = df["close"].diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+
+    avg_gain = gain.ewm(alpha=1 / 14, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / 14, adjust=False).mean()
+
+    rs = avg_gain / avg_loss.replace(0, 0.00000001)
+    df["rsi"] = 100 - (100 / (1 + rs))
+
+    df["volume_avg"] = df["volume"].rolling(20).mean()
+
+    return df.dropna()
+
+
+def analyze_market(symbol):
+    try:
+        df = fetch_candles(symbol)
+
+        if df is None or len(df) < 25:
+            return None
+
+        previous = df.iloc[-2]
+        current = df.iloc[-1]
+
+        score_long = 0
+        score_short = 0
+
+        # EMA direction
+        if current["ema9"] > current["ema21"]:
+            score_long += 1
+        elif current["ema9"] < current["ema21"]:
+            score_short += 1
+
+        # RSI momentum
+        if 50 < current["rsi"] < 68:
+            score_long += 1
+        elif 32 < current["rsi"] < 50:
+            score_short += 1
+
+        # EMA crossover
+        if (
+            previous["ema9"] <= previous["ema21"]
+            and current["ema9"] > current["ema21"]
+        ):
+            score_long += 2
+
+        if (
+            previous["ema9"] >= previous["ema21"]
+            and current["ema9"] < current["ema21"]
+        ):
+            score_short += 2
+
+        # Volume confirmation
+        if current["volume"] > current["volume_avg"]:
+            if current["close"] > current["open"]:
+                score_long += 1
+            elif current["close"] < current["open"]:
+                score_short += 1
+
+        price = float(current["close"])
+
+        if score_long >= CONFIG["MIN_SIGNAL_SCORE"]:
+            direction = "long"
+            score = score_long
+        elif score_short >= CONFIG["MIN_SIGNAL_SCORE"]:
+            direction = "short"
+            score = score_short
+        else:
+            return None
+
+        return {
+            "symbol": symbol,
+            "direction": direction,
+            "score": score,
+            "price": price,
+            "rsi": round(float(current["rsi"]), 2),
+            "time": datetime.now(timezone.utc).isoformat(),
+        }
+
+    except Exception as e:
+        log.warning("Analysis failed for %s: %s", symbol, e)
+        return None
+
+
+def get_free_usdt():
+    balance = exchange.fetch_balance()
+    return float(balance.get("USDT", {}).get("free", 0) or 0)
+
+
+def has_spot_position(symbol):
+    base = symbol.split("/")[0]
+    balance = exchange.fetch_balance()
+    amount = float(balance.get(base, {}).get("total", 0) or 0)
+
+    return amount > 0.00000001
+
+
+def get_contract_amount(symbol, margin, price):
+    market = exchange.market(symbol)
+    contract_size = float(market.get("contractSize") or 1)
+
+    notional = margin * CONFIG["LEVERAGE"]
+    raw_contracts = notional / (price * contract_size)
+
+    amount = float(exchange.amount_to_precision(symbol, raw_contracts))
+
+    minimum = market.get("limits", {}).get("amount", {}).get("min")
+
+    if minimum is not None and amount < float(minimum):
+        raise ValueError(
+            f"Contract minimum is {minimum}; calculated amount is {amount}"
+        )
+
+    if amount <= 0:
+        raise ValueError("Invalid contract amount")
+
+    return amount
+
+
+def place_spot_trade(signal):
+    if state["spot_position"] is not None:
+        return
+
+    symbol = signal["symbol"]
+
+    if has_spot_position(symbol):
+        log.info("Existing spot balance found for %s. Skipping.", symbol)
+        return
+
+    free = get_free_usdt()
+    budget = min(CONFIG["SPOT_BUDGET"], free * 0.98)
+
+    if budget < 5:
+        log.info("Insufficient free USDT for spot.")
+        return
+
+    if signal["direction"] != "long":
+        return
+
+    price = signal["price"]
+    amount = float(exchange.amount_to_precision(symbol, budget / price))
+
+    market = exchange.market(symbol)
+    minimum_cost = market.get("limits", {}).get("cost", {}).get("min")
+
+    if minimum_cost and amount * price < float(minimum_cost):
+        log.info("Spot order below exchange minimum: %s", symbol)
+        return
+
+    log.info("SPOT BUY signal: %s amount=%s", symbol, amount)
+
+    if not CONFIG["LIVE_TRADING"]:
+        return
+
+    order = exchange.create_market_buy_order(symbol, amount)
+
+    average = float(order.get("average") or price)
+    filled = float(order.get("filled") or amount)
+
+    state["spot_position"] = {
+        "symbol": symbol,
+        "amount": filled,
+        "entry": average,
+        "stop": average * (1 - CONFIG["STOP_LOSS"]),
+        "target": average * (1 + CONFIG["TAKE_PROFIT"]),
+        "opened": datetime.now(timezone.utc).isoformat(),
+    }
+
+    state["trades"].append({
+        "market": "spot",
+        "symbol": symbol,
+        "side": "buy",
+        "price": average,
+        "amount": filled,
+        "time": datetime.now(timezone.utc).isoformat(),
+    })
+
+    save_state()
+
+
+def set_isolated_leverage(symbol):
+    exchange.set_leverage(
+        CONFIG["LEVERAGE"],
+        symbol,
+        {"mgnMode": "isolated"},
+    )
+
+
+def get_open_swap_position(symbol):
+    positions = exchange.fetch_positions([symbol])
+
+    for position in positions:
+        contracts = float(position.get("contracts") or 0)
+
+        if contracts > 0:
+            return position
+
+    return None
+
+
+def place_future_trade(signal):
+    if state["future_position"] is not None:
+        return
+
+    swap_symbol = get_swap_symbol(signal["symbol"])
+
+    if not swap_symbol:
+        return
+
+    existing = get_open_swap_position(swap_symbol)
+
+    if existing:
+        log.info("Existing futures position found for %s. Skipping.", swap_symbol)
+        return
+
+    free = get_free_usdt()
+    margin = min(CONFIG["FUTURES_MARGIN"], free * 0.95)
+
+    if margin < 5:
+        log.info("Insufficient free USDT for futures.")
+        return
+
+    price = signal["price"]
+    amount = get_contract_amount(swap_symbol, margin, price)
+
+    side = "buy" if signal["direction"] == "long" else "sell"
+
+    set_isolated_leverage(swap_symbol)
+
+    entry_price = price
+
+    if signal["direction"] == "long":
+        stop_price = price * (1 - CONFIG["STOP_LOSS"])
+        target_price = price * (1 + CONFIG["TAKE_PROFIT"])
+    else:
+        stop_price = price * (1 + CONFIG["STOP_LOSS"])
+        target_price = price * (1 - CONFIG["TAKE_PROFIT"])
+
+    stop_price = exchange.price_to_precision(swap_symbol, stop_price)
+    target_price = exchange.price_to_precision(swap_symbol, target_price)
+
+    params = {
+        "tdMode": "isolated",
+        "lever": str(CONFIG["LEVERAGE"]),
+        "attachAlgoOrds": [{
+            "tpTriggerPx": str(target_price),
+            "tpOrdPx": "-1",
+            "tpTriggerPxType": "mark",
+            "slTriggerPx": str(stop_price),
+            "slOrdPx": "-1",
+            "slTriggerPxType": "mark",
+        }],
+    }
+
+    log.info(
+        "FUTURES %s %s amount=%s entry=%s SL=%s TP=%s",
+        side, swap_symbol, amount, price, stop_price, target_price
+    )
+
+    if not CONFIG["LIVE_TRADING"]:
+        return
+
+    order = exchange.create_order(
+        swap_symbol,
+        "market",
+        side,
+        amount,
+        None,
+        params,
+    )
+
+    average = float(order.get("average") or price)
+    filled = float(order.get("filled") or 0)
+
+    if filled <= 0:
+        log.warning("Futures order has no confirmed fill.")
+        return
+
+    state["future_position"] = {
+        "symbol": swap_symbol,
+        "side": signal["direction"],
+        "amount": filled,
+        "entry": average,
+        "stop": float(stop_price),
+        "target": float(target_price),
+        "order_id": order.get("id"),
+        "opened": datetime.now(timezone.utc).isoformat(),
+    }
+
+    state["trades"].append({
+        "market": "futures",
+        "symbol": swap_symbol,
+        "side": side,
+        "price": average,
+        "amount": filled,
+        "time": datetime.now(timezone.utc).isoformat(),
+    })
+
+    save_state()
+
+
+def monitor_spot_position():
+    position = state.get("spot_position")
+
+    if not position:
+        return
+
+    symbol = position["symbol"]
+
+    ticker = exchange.fetch_ticker(symbol)
+    price = float(ticker["last"])
+
+    should_close = (
+        price <= position["stop"]
+        or price >= position["target"]
+    )
+
+    if not should_close:
+        return
+
+    base = symbol.split("/")[0]
+    balance = exchange.fetch_balance()
+    available = float(balance.get(base, {}).get("free", 0) or 0)
+
+    amount = min(float(position["amount"]), available)
+
+    if amount <= 0:
+        log.warning("No available spot amount to close.")
+        state["spot_position"] = None
+        save_state()
+        return
+
+    amount = float(exchange.amount_to_precision(symbol, amount))
+
+    log.warning("Closing spot position: %s", symbol)
+
+    if not CONFIG["LIVE_TRADING"]:
+        return
+
+    order = exchange.create_market_sell_order(symbol, amount)
+
+    exit_price = float(order.get("average") or price)
+    pnl = (exit_price - position["entry"]) * amount
+
+    state["pnl"] += pnl
+
+    if pnl >= 0:
+        state["wins"] += 1
+    else:
+        state["losses"] += 1
+
+    state["spot_position"] = None
+    save_state()
+
+
+def reconcile_futures_position():
+    position = state.get("future_position")
+
+    if not position:
+        return
+
+    try:
+        current = get_open_swap_position(position["symbol"])
+
+        if current:
+            return
+
+        log.info("Futures position is no longer open: %s", position["symbol"])
+
+        # The exchange-managed TP/SL may have closed the position.
+        # Realized PnL must be reconciled from exchange bills/fills.
+        state["future_position"] = None
+        save_state()
+
+    except Exception as e:
+        record_error("Futures reconciliation: " + str(e))
+
+
+def scan_and_trade():
+    symbols = get_market_symbols()
+    signals = []
+
+    for symbol in symbols:
+        if not state["running"]:
+            break
+
+        signal = analyze_market(symbol)
+
+        if signal:
+            signals.append(signal)
+
+        time.sleep(0.15)
+
+    signals.sort(key=lambda x: x["score"], reverse=True)
+
+    state["scanned"] = len(symbols)
+    state["signals"] = signals[:10]
+    state["last_scan"] = datetime.now(timezone.utc).isoformat()
+
+    if not signals:
+        log.info("No valid trading opportunities.")
+        save_state()
+        return
+
+    best = signals[0]
+
+    log.info(
+        "Best opportunity: %s %s score=%s",
+        best["symbol"],
+        best["direction"],
+        best["score"],
+    )
+
+    if CONFIG["ALLOW_SPOT"]:
+        if best["direction"] == "long":
+            place_spot_trade(best)
+
+    if CONFIG["ALLOW_FUTURES"]:
+        place_future_trade(best)
+
+    save_state()
+
+
+def run_bot():
+    initialize()
+    load_state()
+
+    log.info("DEATH HUNTER V30000 started.")
+
+    while state["running"]:
+        try:
+            if CONFIG["LIVE_TRADING"]:
+                monitor_spot_position()
+                reconcile_futures_position()
+
+            scan_and_trade()
+
         except Exception as e:
-            LAST=f"خطأ: {str(e)[:90]}"; time.sleep(20)
+            record_error(str(e))
 
-threading.Thread(target=hunter_smart, daemon=True).start()
+        time.sleep(CONFIG["SCAN_INTERVAL"])
 
-@app.route('/')
+
+@app.route("/")
 def home():
-    wr = (WINS/(WINS+LOSSES)*100) if (WINS+LOSSES)>0 else 0
-    return f"""
-<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
-<meta http-equiv="refresh" content="5">
-<style>
-body{{margin:0;background:#050507;color:#fff;font-family:monospace}}
-.card{{background:linear-gradient(135deg,rgba(168,85,247,0.15),rgba(0,0,0,0.5));border:1px solid #a855f7;border-radius:16px;padding:14px;margin:10px}}
-.live{{background:#00ff88;color:#000;padding:5px 12px;border-radius:20px;font-size:11px}} .yellow{{color:#facc15}} .red{{color:#ff003c}} .green{{color:#00ff88}}
-.log{{background:#000;border-left:3px solid #00ff88;padding:10px;font-size:12px;margin:10px;border-radius:8px;min-height:40px}}
-</style></head><body>
-<div style="padding:16px;display:flex;justify-content:space-between"><div style="font-size:18px;font-weight:900">DEATH HUNTER</div><div class="live">● SMART V20009</div></div>
-<div class="card">
-<div style="display:flex;justify-content:space-between;font-size:12px">
-<div>BAL <span class="yellow">${BAL:.2f}</span></div>
-<div>PNL <span class="green">${PNLS:.4f}</span></div>
-<div>W/L <span class="green">{WINS}/{LOSSES}</span></div>
-<div>WR <span class="yellow">{wr:.0f}%</span></div>
-</div>
-<div style="display:flex;justify-content:space-between;font-size:11px;margin-top:6px">
-<div>T <span class="green">{TRADES}</span></div>
-<div>LIQ <span class="red">{LIQ}/15</span></div>
-</div>
-<div class="log">{LAST}</div>
-</div>
-<div style="text-align:center;padding:8px;color:#888;font-size:10px">AVAX 1.5 x3 | TP +1.2% | SL -0.7% | 60sec max | بدون تلجرام</div>
-</body></html>
-"""
+    return jsonify({
+        "bot": "DEATH HUNTER V30000",
+        "running": state["running"],
+        "live_trading": CONFIG["LIVE_TRADING"],
+        "spot_budget": CONFIG["SPOT_BUDGET"],
+        "futures_margin": CONFIG["FUTURES_MARGIN"],
+        "leverage": CONFIG["LEVERAGE"],
+        "scanned_coins": state["scanned"],
+        "last_scan": state["last_scan"],
+        "signals": state["signals"],
+        "spot_position": state["spot_position"],
+        "future_position": state["future_position"],
+        "wins": state["wins"],
+        "losses": state["losses"],
+        "pnl": round(state["pnl"], 4),
+        "errors": state["errors"][-5:],
+    })
 
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=int(os.getenv("PORT",10000)))
+
+@app.route("/health")
+def health():
+    return jsonify({"status": "online"})
+
+
+if __name__ == "__main__":
+    import threading
+
+    load_state()
+
+    worker = threading.Thread(target=run_bot, daemon=True)
+    worker.start()
+
+    app.run(
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", "5000")),
+        debug=False,
+        use_reloader=False,
+    )
