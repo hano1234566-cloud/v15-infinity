@@ -83,7 +83,6 @@ def save_config(new_cfg):
     except Exception as e:
         state["errors"].append(f"save cfg {e}"); return False
 
-# === حساب الثروة الجديد - يحسب كل السبوت ===
 def get_free_usdt():
     try: bal=exchange.fetch_balance(); return float(bal.get("USDT",{}).get("free",0) or 0)
     except: return 0
@@ -93,8 +92,6 @@ def get_all_equity_breakdown():
         bal=exchange.fetch_balance()
         futures_free = float(bal.get("USDT",{}).get("free",0) or 0)
         futures_total = float(bal.get("USDT",{}).get("total",0) or futures_free)
-        
-        # حساب كل السبوت القابل للتقييم
         spot_holdings=[]
         total_spot=0.0
         for coin, total_amt in bal.get("total",{}).items():
@@ -110,24 +107,11 @@ def get_all_equity_breakdown():
                     spot_holdings.append({"coin":coin,"amount":amt,"price":price,"value":value})
                     total_spot+=value
             except: continue
-        
-        # فصل Strong/Weak/Other
         strong_val=sum([h["value"] for h in spot_holdings if h["coin"] in CONFIG["SPOT_STRONG_COINS"]])
         weak_val=sum([h["value"] for h in spot_holdings if h["coin"] in CONFIG["SPOT_WEAK_COINS"]])
         other_val=total_spot-strong_val-weak_val
-        
         total_equity=futures_free+total_spot
-        
-        return {
-            "futures_free":futures_free,
-            "futures_total":futures_total,
-            "spot_all":total_spot,
-            "spot_holdings":spot_holdings,
-            "strong_val":strong_val,
-            "weak_val":weak_val,
-            "other_val":other_val,
-            "total":total_equity
-        }
+        return {"futures_free":futures_free,"futures_total":futures_total,"spot_all":total_spot,"spot_holdings":spot_holdings,"strong_val":strong_val,"weak_val":weak_val,"other_val":other_val,"total":total_equity}
     except Exception as e:
         free=get_free_usdt()
         return {"futures_free":free,"futures_total":free,"spot_all":0,"spot_holdings":[],"strong_val":0,"weak_val":0,"other_val":0,"total":free}
@@ -160,7 +144,6 @@ def get_targets(entry,direction):
     if direction=="long": return {"tp":entry*(1+tp_pct),"sl":entry*(1-CONFIG["STOP_LOSS"])}
     else: return {"tp":entry*(1-tp_pct),"sl":entry*(1+CONFIG["STOP_LOSS"])}
 
-# === ATR حقيقي ===
 def calc_true_atr(df, period=14):
     hl=df["high"]-df["low"]
     hc=(df["high"]-df["close"].shift()).abs()
@@ -220,7 +203,6 @@ def get_btc_status():
         if df is None or df_h is None: return "neutral",0, {}
         curr=df.iloc[-1]; curr_h=df_h.iloc[-1]
         atr_pct=curr["atr"]/curr["close"]
-        # فلتر BTC الجديد - أقل تشدد
         info={"ema9":curr["ema9"],"ema21":curr["ema21"],"ema50":curr["ema50"],"ema200":curr["ema200"],"rsi":curr["rsi"],"close":curr["close"]}
         if curr["close"]>curr["ema200"] and curr["ema9"]>curr["ema21"] and curr["ema21"]>curr["ema50"] and curr["rsi"]>52:
             trend="bull"
@@ -240,7 +222,6 @@ def analyze(symbol, btc_trend, btc_info):
         atr_pct=curr["atr"]/curr["close"]
         if atr_pct > 0.05 or atr_pct < 0.0008: return None
         score=0; direction=None
-        # LONG
         if curr["ema9"]>curr["ema21"]>curr["ema50"] and curr["close"]>curr["ema200"]:
             if 48 < curr["rsi"] < 72 and curr["close"]>curr["bb_mid"]:
                 if curr_h["ema9"]<curr_h["ema21"] and btc_trend=="bear": return None
@@ -249,7 +230,6 @@ def analyze(symbol, btc_trend, btc_info):
                 if curr["rsi"]>55 and curr["rsi"]<68: score+=1
                 if btc_trend=="bull": score+=1
                 direction="long"
-        # SHORT
         if curr["ema9"]<curr["ema21"]<curr["ema50"] and curr["close"]<curr["ema200"]:
             if 28 < curr["rsi"] < 52 and curr["close"]<curr["bb_mid"]:
                 if curr_h["ema9"]>curr_h["ema21"] and btc_trend=="bull": return None
@@ -296,7 +276,6 @@ def emergency_close(swap, direction, amount, reason):
         if "51169" not in str(e): state["errors"].append(f"emergency {e}")
         return False
 
-# === حماية طوارئ محلية كل 10 ثواني ===
 def local_protection_loop():
     while state["running"]:
         try:
@@ -312,12 +291,10 @@ def local_protection_loop():
                 mark=float(p.get("markPrice") or p.get("lastPrice") or entry)
                 sl_price = entry*(1-CONFIG["STOP_LOSS"]) if direction=="long" else entry*(1+CONFIG["STOP_LOSS"])
                 buffer=CONFIG["LOCAL_SL_BUFFER"]
-                # إذا السعر كسر SL + buffer وما تقفلت
                 if direction=="long" and mark <= sl_price*(1-buffer):
                     if not verify_sl(symbol):
                         emergency_close(symbol, direction, amount, f"LOCAL SL HIT {mark:.4f} <= {sl_price:.4f} NO SL ON EXCHANGE")
                     else:
-                        # حتى لو SL موجود، لو السعر نزل أكثر من buffer إضافي، إغلاق محلي احتياط
                         if mark <= sl_price*(1-buffer*2):
                             emergency_close(symbol, direction, amount, f"LOCAL SL DOUBLE BUFFER {mark:.4f}")
                 if direction=="short" and mark >= sl_price*(1+buffer):
@@ -463,20 +440,20 @@ def run_bot():
         except Exception as e: state["errors"].append(str(e)[-100:]); state["errors"]=state["errors"][-5:]
         time.sleep(CONFIG["SCAN_INTERVAL"])
 
-DASHBOARD_HTML = """... (نفس لوحة V100001 مع إضافة عرض التفصيلي) ..."""
-# لتقصير الكود، سنستخدم نفس لوحة V100001 السابقة مع تحديث api/status
-# تم اختصار HTML هنا عشان المساحة - استخدم نفس HTML السابق
-
-# سنعيد استخدام نفس الداشبورد مع تعديل بسيط في JS لعرض التفاصيل الجديدة
-DASHBOARD_HTML = open_dashboard_html = """
+DASHBOARD_HTML = """
 <!DOCTYPE html><html lang="ar" dir="rtl"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>V100002 FIXED</title><script src="https://cdn.tailwindcss.com"></script>
+<title>V100002 FIXED + SOUND</title><script src="https://cdn.tailwindcss.com"></script>
 <link href="https://fonts.googleapis.com/css2?family=Tajawal:wght@400;700;800&family=JetBrains+Mono:wght@400&display=swap" rel="stylesheet">
 <style>body{font-family:'Tajawal',sans-serif;background:#0a0e14;color:#e5e7eb}.card{background:#111827;border:1px solid #1f2937}.mono{font-family:'JetBrains Mono',monospace}</style>
 </head><body class="p-3 md:p-6"><div class="max-w-7xl mx-auto">
 <div class="flex justify-between items-center mb-4">
-<div><h1 class="text-2xl font-extrabold">V100002 <span class="text-green-400">FIXED</span></h1><p id="autoModeTop" class="text-xs font-bold text-yellow-400">ATR حقيقي + حماية محلية</p></div>
-<div class="flex gap-2"><button onclick="showTab('dash')" id="btn-dash" class="bg-blue-600 px-3 py-1 rounded text-xs">الرئيسية</button><button onclick="showTab('editor')" id="btn-editor" class="bg-gray-800 px-3 py-1 rounded text-xs">⚙️ محرر</button><span id="status-dot" class="w-3 h-3 bg-green-500 rounded-full animate-pulse mt-2"></span></div>
+<div><h1 class="text-2xl font-extrabold">V100002 <span class="text-green-400">+ SOUND FULL</span></h1><p id="autoModeTop" class="text-xs font-bold text-yellow-400">ATR حقيقي + حماية 10ث + تنبيه صوتي 🔊</p></div>
+<div class="flex gap-2">
+<button onclick="toggleSound()" id="soundBtn" class="bg-yellow-600 hover:bg-yellow-500 px-3 py-1 rounded text-xs font-bold">🔇 فعل الصوت</button>
+<button onclick="showTab('dash')" id="btn-dash" class="bg-blue-600 px-3 py-1 rounded text-xs">الرئيسية</button>
+<button onclick="showTab('editor')" id="btn-editor" class="bg-gray-800 px-3 py-1 rounded text-xs">⚙️ محرر</button>
+<span id="status-dot" class="w-3 h-3 bg-green-500 rounded-full animate-pulse mt-2"></span>
+</div>
 </div>
 <div id="tab-dash">
 <div class="card rounded-xl p-3 mb-4 bg-gradient-to-r from-blue-900/30 to-purple-900/30 border-blue-800">
@@ -487,26 +464,29 @@ DASHBOARD_HTML = open_dashboard_html = """
 <div class="card rounded-xl p-3"><p class="text-[11px] text-gray-400">فيوتشر حر</p><p id="balance" class="text-lg font-bold">--</p><p id="spotAll" class="text-[10px] text-gray-400">سبوت: --</p></div>
 <div class="card rounded-xl p-3"><p class="text-[11px] text-gray-400">ربح اليوم</p><p id="daily" class="text-lg font-bold">--</p><p id="emergency" class="text-[10px] text-red-400">--</p></div>
 <div class="card rounded-xl p-3"><p class="text-[11px] text-gray-400">صفقات</p><p id="open" class="text-lg font-bold">-- / 2</p></div>
-<div class="card rounded-xl p-3"><p class="text-[11px] text-gray-400">BTC فلتر جديد</p><p id="btc" class="text-xs font-bold">--</p><p id="btcInfo" class="text-[9px] text-gray-500">--</p></div>
+<div class="card rounded-xl p-3"><p class="text-[11px] text-gray-400">BTC فلتر</p><p id="btc" class="text-xs font-bold">--</p><p id="btcInfo" class="text-[9px] text-gray-500">--</p></div>
 <div class="card rounded-xl p-3"><p class="text-[11px] text-gray-400">خسائر</p><p id="consec" class="text-lg font-bold">--</p></div>
 </div>
 <div class="grid grid-cols-1 lg:grid-cols-3 gap-4">
 <div class="lg:col-span-2 space-y-4">
-<div class="card rounded-xl p-4"><div class="flex justify-between mb-2"><h3 class="font-bold text-sm">📊 فيوتشر + حماية محلية</h3><span class="text-[10px] bg-green-900 px-2 py-1 rounded">ATR حقيقي + LOCAL SL</span></div><div id="positions" class="space-y-2 text-xs"></div></div>
-<div class="card rounded-xl p-4"><h3 class="font-bold text-sm mb-2">🎯 إشارات GOD 7/10 (فلتر BTC مصحح)</h3><div id="signals" class="space-y-2 text-xs"></div></div>
+<div class="card rounded-xl p-4"><div class="flex justify-between mb-2"><h3 class="font-bold text-sm">📊 فيوتشر + حماية محلية 10ث</h3><span class="text-[10px] bg-green-900 px-2 py-1 rounded">ATR حقيقي</span></div><div id="positions" class="space-y-2 text-xs"></div></div>
+<div class="card rounded-xl p-4"><h3 class="font-bold text-sm mb-2">🎯 إشارات GOD 7/10 🔊</h3><div id="signals" class="space-y-2 text-xs"></div></div>
 <div class="card rounded-xl p-4"><h3 class="font-bold text-sm mb-2">📜 سجل</h3><div id="trades" class="space-y-1 text-[11px] max-h-40 overflow-y-auto mono"></div></div>
 </div>
 <div class="space-y-4">
-<div class="card rounded-xl p-4 border-yellow-900"><h3 class="font-bold text-sm mb-2">💰 كل السبوت (قابل للتقييم)</h3><div id="spot" class="space-y-2 text-xs"></div><button onclick="forceSell()" class="bg-yellow-600 hover:bg-yellow-700 text-white text-[11px] px-3 py-2 rounded w-full mt-2">بيع الضعاف الآن</button></div>
-<div class="card rounded-xl p-4"><h3 class="font-bold text-xs mb-2">⚙️ تحكم</h3><div class="grid grid-cols-2 gap-2"><button onclick="resetDaily()" class="bg-gray-800 text-[11px] px-2 py-2 rounded">إعادة ضبط يومي</button><button onclick="load()" class="bg-blue-900 text-[11px] px-2 py-2 rounded">تحديث</button></div><div id="stopped" class="hidden mt-2 bg-red-900/30 border border-red-700 p-2 rounded text-[11px]"></div></div>
+<div class="card rounded-xl p-4 border-yellow-900"><h3 class="font-bold text-sm mb-2">💰 كل السبوت</h3><div id="spot" class="space-y-2 text-xs"></div><button onclick="forceSell()" class="bg-yellow-600 text-white text-[11px] px-3 py-2 rounded w-full mt-2">بيع الضعاف</button></div>
+<div class="card rounded-xl p-4"><h3 class="font-bold text-xs mb-2">⚙️ تحكم</h3><div class="grid grid-cols-2 gap-2"><button onclick="resetDaily()" class="bg-gray-800 text-[11px] px-2 py-2 rounded">إعادة ضبط</button><button onclick="load()" class="bg-blue-900 text-[11px] px-2 py-2 rounded">تحديث</button><button onclick="testSound()" class="bg-purple-900 text-[11px] px-2 py-2 rounded col-span-2">🔊 جرب الصوت</button></div><div id="stopped" class="hidden mt-2 bg-red-900/30 border border-red-700 p-2 rounded text-[11px]"></div></div>
 <div class="card rounded-xl p-4"><p class="text-[11px] text-gray-400">فحص: <span id="scanned">--</span> | لفة: <span id="loop">--</span> | آخر: <span id="last">--</span></p><p class="text-[10px] text-gray-500 mt-1">باع: <span id="spotsold">--</span></p><div id="errors" class="mt-1 text-[10px] text-red-400"></div></div>
 </div>
 </div>
 </div>
 <div id="tab-editor" class="hidden">
 <div class="card rounded-xl p-4 mb-4">
-<h3 class="font-bold mb-3">🔧 محرر الإعدادات</h3>
-<div class="bg-blue-900/20 border border-blue-700 p-3 rounded mb-3 text-[11px]"><p>✅ ATR حقيقي | ✅ حماية محلية 10ث | ✅ فلتر BTC مصحح | ✅ حساب كل السبوت</p></div>
+<h3 class="font-bold mb-3">🔧 محرر الإعدادات + الصوت</h3>
+<div class="bg-blue-900/20 border border-blue-700 p-3 rounded mb-3 text-[11px]"><p>✅ ATR حقيقي | ✅ حماية محلية 10ث | ✅ فلتر BTC | ✅ صوت 4 أنواع</p>
+<p class="mt-1">بيب بيب=إشارة | 3 نغمات=دخول | فلوس=سبوت | ترقية=وصول 50$</p>
+<button onclick="testSound()" class="bg-purple-700 px-3 py-1 rounded mt-2 text-xs">🔊 جرب كل الأصوات</button>
+</div>
 <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
 <div><label class="text-xs text-gray-400">RSI قمة أولى (بيع 50%)</label><input id="cfg_RSI70" type="number" class="w-full bg-[#0a0e14] border border-gray-700 rounded p-2 text-xs mt-1"></div>
 <div><label class="text-xs text-gray-400">RSI قمة نهائية (بيع 100%)</label><input id="cfg_RSI75" type="number" class="w-full bg-[#0a0e14] border border-gray-700 rounded p-2 text-xs mt-1"></div>
@@ -515,12 +495,48 @@ DASHBOARD_HTML = open_dashboard_html = """
 </div>
 <div class="mt-4"><label class="text-xs text-gray-400">العملات الضعيفة</label><input id="cfg_WEAK" type="text" class="w-full bg-[#0a0e14] border border-gray-700 rounded p-2 text-xs mt-1 mono"></div>
 <div class="mt-2"><label class="text-xs text-gray-400">العملات القوية</label><input id="cfg_STRONG" type="text" class="w-full bg-[#0a0e14] border border-gray-700 rounded p-2 text-xs mt-1 mono"></div>
-<div class="flex gap-2 mt-4"><button onclick="saveCfg()" class="bg-green-600 hover:bg-green-700 px-4 py-2 rounded text-xs font-bold">💾 حفظ</button><button onclick="loadCfg()" class="bg-gray-800 px-4 py-2 rounded text-xs">↩️ إلغاء</button></div>
+<div class="flex gap-2 mt-4"><button onclick="saveCfg()" class="bg-green-600 px-4 py-2 rounded text-xs font-bold">💾 حفظ</button><button onclick="loadCfg()" class="bg-gray-800 px-4 py-2 rounded text-xs">إلغاء</button></div>
 <div id="cfgMsg" class="mt-2 text-xs"></div>
 </div>
 </div>
 </div>
 <script>
+// === SOUND SYSTEM V100002 ===
+let soundEnabled=false,lastSignals=0,lastPos=0,lastSpotSold=0,lastTotal=0,lastEm=0,audioCtx=null;
+function toggleSound(){
+  soundEnabled=!soundEnabled;
+  const btn=document.getElementById('soundBtn');
+  btn.textContent=soundEnabled?'🔊 الصوت شغال':'🔇 فعل الصوت';
+  btn.className=soundEnabled?'bg-green-600 hover:bg-green-500 px-3 py-1 rounded text-xs font-bold':'bg-yellow-600 hover:bg-yellow-500 px-3 py-1 rounded text-xs font-bold';
+  if(soundEnabled){
+    try{audioCtx=new (window.AudioContext||window.webkitAudioContext)();}catch(e){}
+    playTone(800,0.2,0.4);
+    localStorage.setItem('sound','1');
+  }else localStorage.setItem('sound','0');
+}
+function playTone(freq,dur,vol=0.3){
+  if(!soundEnabled||!audioCtx) return;
+  try{
+    const o=audioCtx.createOscillator(); const g=audioCtx.createGain();
+    o.type='sine'; o.frequency.value=freq; o.connect(g); g.connect(audioCtx.destination); g.gain.value=vol;
+    o.start(); g.gain.exponentialRampToValueAtTime(0.01,audioCtx.currentTime+dur); o.stop(audioCtx.currentTime+dur);
+  }catch(e){}
+}
+function playPattern(type){
+  if(!soundEnabled) return;
+  if(type==='signal'){playTone(600,0.15); setTimeout(()=>playTone(900,0.15),200);}
+  if(type==='entry'){playTone(500,0.3,0.4); setTimeout(()=>playTone(800,0.3,0.4),300); setTimeout(()=>playTone(1200,0.5,0.4),600);}
+  if(type==='spot'){playTone(1000,0.2); setTimeout(()=>playTone(1200,0.2),150); setTimeout(()=>playTone(1500,0.4),300);}
+  if(type==='emergency'){playTone(300,0.8,0.5); setTimeout(()=>playTone(200,0.8,0.5),900);}
+  if(type==='upgrade'){for(let i=0;i<5;i++) setTimeout(()=>playTone(700+i*200,0.25,0.4), i*200);}
+}
+function testSound(){
+  if(!soundEnabled) toggleSound();
+  setTimeout(()=>playPattern('signal'),200);
+  setTimeout(()=>playPattern('entry'),1000);
+  setTimeout(()=>playPattern('spot'),2500);
+  setTimeout(()=>playPattern('upgrade'),4000);
+}
 function showTab(t){
  document.getElementById('tab-dash').classList.toggle('hidden', t!=='dash');
  document.getElementById('tab-editor').classList.toggle('hidden', t!=='editor');
@@ -545,10 +561,10 @@ async function load(){
   document.getElementById('last').textContent = d.last_scan ? new Date(d.last_scan).toLocaleTimeString('ar-SA') : '--';
   document.getElementById('spotsold').textContent = (d.spot_sold||[]).join(', ') || 'لم يبع';
   document.getElementById('autoMode').textContent = d.auto_mode;
-  document.getElementById('autoModeTop').textContent = d.auto_mode + ' | ATR حقيقي + حماية 10ث';
+  document.getElementById('autoModeTop').textContent = d.auto_mode + ' + SOUND 🔊 | ATR حقيقي';
   document.getElementById('autoDetail').textContent = 'مخاطرة ' + (d.auto_risk*100).toFixed(1) + '% | رافعة ' + d.auto_lev + 'x | TP ' + (d.auto_tp*100).toFixed(1) + '% | CANDLE:' + d.candle_limit;
   document.getElementById('totalEq').textContent = d.total_equity.toFixed(2) + ' $';
-  document.getElementById('breakdown').textContent = 'فيوتشر: '+d.futures_free.toFixed(2)+'$ | سبوت قوي: '+d.strong_val.toFixed(2)+'$ | ضعيف: '+d.weak_val.toFixed(2)+'$ | أخرى: '+d.other_val.toFixed(2)+'$';
+  document.getElementById('breakdown').textContent = 'فيوتشر: '+d.futures_free.toFixed(2)+'$ | قوي: '+d.strong_val.toFixed(2)+'$ | ضعيف: '+d.weak_val.toFixed(2)+'$ | أخرى: '+d.other_val.toFixed(2)+'$';
   if(d.next_to_target>0){
    document.getElementById('nextTarget').textContent = 'باقي ' + d.next_to_target.toFixed(2) + '$ للترقية لـ ' + d.next_mode;
    const pct = Math.min(100, (d.total_equity / (d.total_equity + d.next_to_target))*100);
@@ -558,9 +574,17 @@ async function load(){
    document.getElementById('progressBar').style.width = '100%';
   }
   const stoppedDiv = document.getElementById('stopped');
-  if(d.stopped){ stoppedDiv.classList.remove('hidden'); stoppedDiv.textContent = '⛔ متوقف: ' + d.stopped_reason; document.getElementById('status-dot').className='w-3 h-3 bg-red-500 rounded-full mt-2'; } else { stoppedDiv.classList.add('hidden'); document.getElementById('status-dot').className='w-3 h-3 bg-green-500 rounded-full animate-pulse mt-2'; }
+  if(d.stopped){ stoppedDiv.classList.remove('hidden'); stoppedDiv.textContent = '⛔ متوقف: ' + d.stopped_reason; } else { stoppedDiv.classList.add('hidden'); }
+  if(d.signals && d.signals.length>lastSignals && lastSignals!==0){playPattern('signal');}
+  if(d.open_count>lastPos){playPattern('entry');}
+  if(d.spot_sold && d.spot_sold.length>lastSpotSold && lastSpotSold!==0){playPattern('spot');}
+  const prevMode=localStorage.getItem('lastMode');
+  if(prevMode && prevMode!==d.auto_mode){playPattern('upgrade');}
+  if(d.emergency_closes>lastEm && lastEm!==0){playPattern('emergency');}
+  lastSignals=d.signals.length; lastPos=d.open_count; lastSpotSold=d.spot_sold.length; lastEm=d.emergency_closes;
+  localStorage.setItem('lastMode',d.auto_mode);
   const posDiv = document.getElementById('positions');
-  if(d.positions && d.positions.length>0){ posDiv.innerHTML = d.positions.map(p=>{ const pnlClass = p.pnl>=0?'text-green-400':'text-red-400'; const prot = p.has_sl ? '✓ SL منصة' : '⚠️ حماية محلية'; return `<div class="bg-[#0a0e14] border border-gray-800 rounded p-2 flex justify-between"><div><p class="font-bold">${p.symbol} <span class="text-[10px] ${p.side=='long'?'text-green-400':'text-red-400'}">${p.side}</span></p><p class="text-[10px] text-gray-400">دخول: ${p.entry} | SL: ${p.sl||'--'}</p></div><div class="text-left"><p class="font-bold ${pnlClass}">${p.pnl} $</p><p class="text-[9px] ${p.has_sl?'text-green-500':'text-yellow-500'}">${prot}</p></div></div>`; }).join(''); } else { posDiv.innerHTML = '<p class="text-gray-500">لا صفقات - GOD 7/10 + حماية محلية نشطة</p>'; }
+  if(d.positions && d.positions.length>0){ posDiv.innerHTML = d.positions.map(p=>{ const pnlClass = p.pnl>=0?'text-green-400':'text-red-400'; const prot = p.has_sl ? '✓ SL منصة' : '⚠️ حماية محلية 10ث'; return `<div class="bg-[#0a0e14] border border-gray-800 rounded p-2 flex justify-between"><div><p class="font-bold">${p.symbol} <span class="text-[10px] ${p.side=='long'?'text-green-400':'text-red-400'}">${p.side}</span></p><p class="text-[10px] text-gray-400">دخول: ${p.entry} | SL: ${p.sl||'--'}</p></div><div class="text-left"><p class="font-bold ${pnlClass}">${p.pnl} $</p><p class="text-[9px] ${p.has_sl?'text-green-500':'text-yellow-500'}">${prot}</p></div></div>`; }).join(''); } else { posDiv.innerHTML = '<p class="text-gray-500">لا صفقات - GOD 7/10 + حماية محلية نشطة</p>'; }
   const sigDiv = document.getElementById('signals');
   if(d.signals && d.signals.length>0){ sigDiv.innerHTML = d.signals.map(s=>`<div class="flex justify-between bg-[#0a0e14] rounded p-2"><span>${s.symbol} ${s.direction} RSI:${s.rsi} ATR:${s.atr_pct}%</span><span class="bg-blue-900 px-2 rounded">${s.score}/10</span></div>`).join(''); } else { sigDiv.innerHTML = '<p class="text-gray-500">لا إشارات قوية</p>'; }
   document.getElementById('errors').textContent = (d.errors||[]).join(' | ');
@@ -568,8 +592,8 @@ async function load(){
   const spotDiv = document.getElementById('spot');
   if(spotData.holdings){ spotDiv.innerHTML = spotData.holdings.map(h=>{ const adviceClass = h.advice.includes('بيع')?'text-yellow-400':'text-green-400'; return `<div class="bg-[#0a0e14] border border-gray-800 rounded p-2"><div class="flex justify-between"><span class="font-bold">${h.coin}</span><span>${h.value_usdt}$ ${h.coin_type?'<span class=text-[9px] bg-gray-700 px-1 rounded>'+h.coin_type+'</span>':''}</span></div><p class="text-[11px] text-gray-400">${h.trend} RSI:${h.rsi||'--'}</p><p class="text-[11px] ${adviceClass}">${h.advice}</p></div>`; }).join('') + `<p class="text-[11px] text-gray-500 mt-2">الإجمالي كل السبوت: ${spotData.total_spot_value}$ | قوي: ${spotData.strong}$ | ضعيف: ${spotData.weak}$ | أخرى: ${spotData.other}$</p>`; }
   const tradesRes = await fetch('/trades'); const tradesData = await tradesRes.json();
-  document.getElementById('trades').innerHTML = tradesData.slice(-12).reverse().map(t=>{ const color = t.type.includes('ENTRY')?'text-blue-400': t.pnl>0?'text-green-400':'text-red-400'; const extra = t.reason ? ' '+t.reason : ''; return `<p class="${color}">${new Date(t.time).toLocaleTimeString('ar-SA')} - ${t.type} ${t.symbol||''} ${t.pnl!=undefined?'PnL:'+t.pnl:''}${extra}</p>`; }).join('') || '<p class="text-gray-500">لا سجل</p>';
- }catch(e){}
+  document.getElementById('trades').innerHTML = tradesData.slice(-12).reverse().map(t=>{ const color = t.type.includes('ENTRY')?'text-blue-400': t.pnl>0?'text-green-400':'text-red-400'; return `<p class="${color}">${new Date(t.time).toLocaleTimeString('ar-SA')} - ${t.type} ${t.symbol||''} ${t.pnl!=undefined?'PnL:'+t.pnl:''}</p>`; }).join('') || '<p class="text-gray-500">لا سجل</p>';
+ }catch(e){console.log(e);}
 }
 async function forceSell(){ if(!confirm('بيع الضعاف؟')) return; const r=await fetch('/spot/force_sell_weak'); const d=await r.json(); alert('تم: '+(d.sold_now||[]).join(', ')); load(); }
 async function resetDaily(){ if(!confirm('إعادة ضبط؟')) return; await fetch('/reset_daily'); load(); }
@@ -594,8 +618,8 @@ async function saveCfg(){
  const r = await fetch('/api/config', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(newCfg)});
  const d = await r.json();
  document.getElementById('cfgMsg').textContent = d.ok ? '✅ تم الحفظ' : '❌ خطأ: '+d.error;
- document.getElementById('cfgMsg').className = 'mt-2 text-xs ' + (d.ok ? 'text-green-400' : 'text-red-400');
 }
+if(localStorage.getItem('sound')==='1'){setTimeout(()=>{if(!soundEnabled) toggleSound();},800);}
 load(); setInterval(load, 10000);
 </script></body></html>
 """
@@ -697,10 +721,10 @@ def force_sell_weak():
     sold=auto_spot_manager()
     return jsonify({"sold_now":sold,"all_sold":state["spot_sold"]})
 @app.route("/health")
-def health(): return jsonify({"status":"online","version":"V100002 FIXED","atr":"true","protection":"local 10s","candle":CONFIG["CANDLE_LIMIT"]})
+def health(): return jsonify({"status":"online","version":"V100002 FIXED + SOUND","atr":"true","protection":"local 10s","candle":CONFIG["CANDLE_LIMIT"],"sound":"enabled"})
 
 if __name__=="__main__":
     threading.Thread(target=run_bot,daemon=True).start()
     threading.Thread(target=local_protection_loop,daemon=True).start()
-    log.info("V100002 FIXED started: ATR true, LOCAL SL 10s, BTC filter fixed, CANDLE 300, ALL SPOT equity")
+    log.info("V100002 FIXED + SOUND started: ATR true, LOCAL SL 10s, BTC filter fixed, CANDLE 300, ALL SPOT equity + AUDIO ALERTS")
     app.run(host="0.0.0.0",port=int(os.getenv("PORT","5000")),debug=False,use_reloader=False)
