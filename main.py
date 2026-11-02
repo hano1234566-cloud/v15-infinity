@@ -19,16 +19,26 @@ CONFIG = {
     "BTC_VOLATILITY_LIMIT": 0.04,
     "STATE_FILE": "bot_state.json",
     "TRADES_FILE": "trades_log.json",
+    "CONFIG_FILE": "config.json",
     "SPOT_AUTO_SELL_WEAK": True,
-    "SPOT_WEAK_COINS": ["SOPH","CORE","XPL","WET"],
+    "SPOT_WEAK_COINS": ["SOPH","CORE","XPL","WET","BONK"],
     "SPOT_STRONG_COINS": ["AAVE","DOGE","TRX"],
     "SPOT_SELL_RSI_PEAK": 70,
     "SPOT_SELL_RSI_TOP": 75,
 }
 
+# تحميل الكونفق الخارجي اذا موجود
+try:
+    if os.path.exists(CONFIG["CONFIG_FILE"]):
+        with open(CONFIG["CONFIG_FILE"],"r") as f:
+            ext=json.load(f)
+            CONFIG.update(ext)
+except: pass
+
 API_KEY=os.getenv("OKX_API_KEY","").strip() or os.getenv("OKX_KEY","").strip()
 API_SECRET=os.getenv("OKX_API_SECRET","").strip() or os.getenv("OKX_SECRET_KEY","").strip() or os.getenv("OKX_SECRET","").strip()
 API_PASSWORD=os.getenv("OKX_API_PASSWORD","").strip() or os.getenv("OKX_PASSPHRASE","").strip()
+EDITOR_PASS=os.getenv("EDITOR_PASSWORD","1234")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
 log=logging.getLogger("V100DASH")
@@ -70,6 +80,16 @@ def save_trade_log(entry):
         trades=load_trades(); trades.append(entry)
         with open(CONFIG["TRADES_FILE"],"w") as f: json.dump(trades[-300:], f, indent=2)
     except: pass
+
+def save_config(new_cfg):
+    try:
+        with open(CONFIG["CONFIG_FILE"],"w") as f:
+            json.dump(new_cfg, f, indent=2)
+        CONFIG.update(new_cfg)
+        return True
+    except Exception as e:
+        state["errors"].append(f"save cfg {e}")
+        return False
 
 CORRELATED_GROUPS = {
     "MAJORS": ["BTC/USDT:USDT","ETH/USDT:USDT","SOL/USDT:USDT","AVAX/USDT:USDT","ADA/USDT:USDT","DOT/USDT:USDT"],
@@ -201,13 +221,15 @@ def verify_sl(swap):
 
 def emergency_close(swap, direction, amount, reason):
     try:
+        pos_check = exchange.fetch_positions([swap])
+        has_pos = any(float(p.get("contracts") or 0)>0 for p in pos_check)
+        if not has_pos: return
         side_close="sell" if direction=="long" else "buy"
         posSide="long" if direction=="long" else "short"
         exchange.create_order(swap,"market",side_close,amount,None,{"tdMode":"isolated","posSide":posSide})
-        log.warning(f"EMERGENCY CLOSE {swap} reason:{reason}")
         save_trade_log({"time":datetime.now(timezone.utc).isoformat(),"type":"EMERGENCY_CLOSE","symbol":swap,"reason":reason})
     except Exception as e:
-        state["errors"].append(f"emergency fail {e}")
+        if "51169" not in str(e): state["errors"].append(f"emergency {e}")
 
 def place_trade(signal):
     total, cnt, _, open_syms = get_positions()
@@ -244,7 +266,6 @@ def place_trade(signal):
         state["open_trades"][swap]={"entry":avg,"direction":signal["direction"],"margin":margin,"amount":filled,"time":datetime.now(timezone.utc).isoformat()}
         save_state()
         save_trade_log({"time":datetime.now(timezone.utc).isoformat(),"type":"ENTRY","symbol":swap,"direction":signal["direction"],"entry":avg,"margin":margin,"amount":filled,"score":signal["score"]})
-        log.info(f"SAFE OPEN {swap} {signal['direction']} margin:{margin}$")
     except Exception as e: state["errors"].append(str(e)[-150:])
 
 def check_closed_and_update_pnl():
@@ -311,13 +332,13 @@ def auto_spot_manager():
                     if df is None: continue
                     curr=df.iloc[-1]
                     rsi=float(curr["rsi"])
-                    price=float(curr["close"])
-                    action=None
                     if rsi>=CONFIG["SPOT_SELL_RSI_TOP"]:
                         action="SELL 100%"; pct=100
                     elif rsi>=CONFIG["SPOT_SELL_RSI_PEAK"]:
                         if f"{coin}_50" not in state["spot_sold"]:
                             action="SELL 50%"; pct=50
+                        else: action=None
+                    else: action=None
                     if action:
                         exchange.options["defaultType"]="spot"
                         sell_amt=amt*pct/100
@@ -362,157 +383,195 @@ def scan_and_trade():
     if signals: place_trade(signals[0])
 
 def run_bot():
-    log.info("V100000 DASHBOARD STARTED")
     while state["running"]:
         try: scan_and_trade()
         except Exception as e: state["errors"].append(str(e)[-100:]); state["errors"]=state["errors"][-5:]
         time.sleep(CONFIG["SCAN_INTERVAL"])
 
-# ===== واجهة احترافية =====
 DASHBOARD_HTML = """
 <!DOCTYPE html>
 <html lang="ar" dir="rtl">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>V100000 - لوحة التحكم الاحترافية</title>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>V100000 - محرر كود احترافي</title>
 <script src="https://cdn.tailwindcss.com"></script>
-<link href="https://fonts.googleapis.com/css2?family=Tajawal:wght@400;700;800&display=swap" rel="stylesheet">
-<style>body{font-family:'Tajawal',sans-serif;background:#0a0e14;color:#e5e7eb} .card{background:#111827;border:1px solid #1f2937} .glow{box-shadow:0 0 20px rgba(59,130,246,0.15)}</style>
+<link href="https://fonts.googleapis.com/css2?family=Tajawal:wght@400;700;800&family=JetBrains+Mono:wght@400&display=swap" rel="stylesheet">
+<style>body{font-family:'Tajawal',sans-serif;background:#0a0e14;color:#e5e7eb} .card{background:#111827;border:1px solid #1f2937} .mono{font-family:'JetBrains Mono',monospace}</style>
 </head>
 <body class="p-3 md:p-6">
 <div class="max-w-7xl mx-auto">
-<!-- Header -->
-<div class="flex justify-between items-center mb-6">
-<div><h1 class="text-3xl font-extrabold">V100000 <span class="text-blue-500">GOD</span></h1><p class="text-sm text-gray-400">حماية رأس المال أولاً - واجهة احترافية</p></div>
-<div class="flex gap-2"><span id="status-dot" class="w-3 h-3 bg-green-500 rounded-full animate-pulse mt-2"></span><span id="status-text" class="text-sm">يعمل</span></div>
+<div class="flex justify-between items-center mb-4">
+<div><h1 class="text-2xl font-extrabold">V100000 <span class="text-blue-500">GOD</span></h1><p class="text-xs text-gray-400">لوحة تحكم + محرر كود مباشر</p></div>
+<div class="flex gap-2">
+<button onclick="showTab('dash')" id="btn-dash" class="bg-blue-600 px-3 py-1 rounded text-xs">الرئيسية</button>
+<button onclick="showTab('editor')" id="btn-editor" class="bg-gray-800 px-3 py-1 rounded text-xs">⚙️ تعديل الكود</button>
+<span id="status-dot" class="w-3 h-3 bg-green-500 rounded-full animate-pulse mt-2"></span>
+</div>
 </div>
 
-<!-- Top Stats -->
+<!-- DASH TAB -->
+<div id="tab-dash">
 <div class="grid grid-cols-2 md:grid-cols-5 gap-3 mb-6">
-<div class="card rounded-xl p-4 glow"><p class="text-xs text-gray-400">الرصيد الحر</p><p id="balance" class="text-xl font-bold">-- USDT</p></div>
-<div class="card rounded-xl p-4"><p class="text-xs text-gray-400">ربح اليوم</p><p id="daily" class="text-xl font-bold">--</p></div>
-<div class="card rounded-xl p-4"><p class="text-xs text-gray-400">صفقات مفتوحة</p><p id="open" class="text-xl font-bold">-- / 2</p></div>
-<div class="card rounded-xl p-4"><p class="text-xs text-gray-400">BTC</p><p id="btc" class="text-sm font-bold">--</p><p id="btcvol" class="text-xs text-gray-500"></p></div>
-<div class="card rounded-xl p-4"><p class="text-xs text-gray-400">خسائر متتالية</p><p id="consec" class="text-xl font-bold">-- / 3</p></div>
+<div class="card rounded-xl p-3"><p class="text-[11px] text-gray-400">الرصيد الحر</p><p id="balance" class="text-lg font-bold">--</p></div>
+<div class="card rounded-xl p-3"><p class="text-[11px] text-gray-400">ربح اليوم</p><p id="daily" class="text-lg font-bold">--</p></div>
+<div class="card rounded-xl p-3"><p class="text-[11px] text-gray-400">صفقات</p><p id="open" class="text-lg font-bold">-- / 2</p></div>
+<div class="card rounded-xl p-3"><p class="text-[11px] text-gray-400">BTC</p><p id="btc" class="text-xs font-bold">--</p></div>
+<div class="card rounded-xl p-3"><p class="text-[11px] text-gray-400">خسائر</p><p id="consec" class="text-lg font-bold">--</p></div>
 </div>
-
 <div class="grid grid-cols-1 lg:grid-cols-3 gap-4">
-<!-- Positions -->
 <div class="lg:col-span-2 space-y-4">
-<div class="card rounded-xl p-4">
-<div class="flex justify-between mb-3"><h3 class="font-bold">📊 صفقات الفيوتشر المفتوحة</h3><span class="text-xs bg-blue-900 px-2 py-1 rounded">حماية SL نشطة</span></div>
-<div id="positions" class="space-y-2"><p class="text-gray-500 text-sm">لا يوجد صفقات - ينتظر إشارة GOD 7/10</p></div>
+<div class="card rounded-xl p-4"><div class="flex justify-between mb-2"><h3 class="font-bold text-sm">📊 صفقات الفيوتشر</h3><span class="text-[10px] bg-blue-900 px-2 py-1 rounded">SL محمي</span></div><div id="positions" class="space-y-2 text-xs"></div></div>
+<div class="card rounded-xl p-4"><h3 class="font-bold text-sm mb-2">🎯 إشارات GOD</h3><div id="signals" class="space-y-2 text-xs"></div></div>
+<div class="card rounded-xl p-4"><h3 class="font-bold text-sm mb-2">📜 سجل</h3><div id="trades" class="space-y-1 text-[11px] max-h-40 overflow-y-auto mono"></div></div>
 </div>
-
-<div class="card rounded-xl p-4">
-<h3 class="font-bold mb-3">🎯 إشارات قادمة (GOD SCORE)</h3>
-<div id="signals" class="space-y-2"><p class="text-gray-500 text-sm">جاري الفحص...</p></div>
-</div>
-
-<div class="card rounded-xl p-4">
-<h3 class="font-bold mb-3">📜 سجل الصفقات الأخير</h3>
-<div id="trades" class="space-y-1 text-xs max-h-60 overflow-y-auto"></div>
-</div>
-</div>
-
-<!-- Spot -->
 <div class="space-y-4">
-<div class="card rounded-xl p-4 border-yellow-800">
-<h3 class="font-bold mb-3">💰 محفظة السبوت القديمة</h3>
-<div id="spot" class="space-y-2"></div>
-<div class="mt-3 flex gap-2">
-<button onclick="forceSell()" class="bg-yellow-600 hover:bg-yellow-700 text-white text-xs px-3 py-2 rounded w-full">بيع العملات الضعيفة الآن</button>
+<div class="card rounded-xl p-4 border-yellow-900"><h3 class="font-bold text-sm mb-2">💰 السبوت القديم</h3><div id="spot" class="space-y-2 text-xs"></div><button onclick="forceSell()" class="bg-yellow-600 hover:bg-yellow-700 text-white text-[11px] px-3 py-2 rounded w-full mt-2">بيع الضعاف الآن</button></div>
+<div class="card rounded-xl p-4"><h3 class="font-bold text-xs mb-2">⚙️ تحكم</h3><div class="grid grid-cols-2 gap-2"><button onclick="resetDaily()" class="bg-gray-800 text-[11px] px-2 py-2 rounded">إعادة ضبط يومي</button><button onclick="load()" class="bg-blue-900 text-[11px] px-2 py-2 rounded">تحديث</button></div><div id="stopped" class="hidden mt-2 bg-red-900/30 border border-red-700 p-2 rounded text-[11px]"></div></div>
+<div class="card rounded-xl p-4"><p class="text-[11px] text-gray-400">فحص: <span id="scanned">--</span> | لفة: <span id="loop">--</span> | آخر: <span id="last">--</span></p><p class="text-[10px] text-gray-500 mt-1">باع: <span id="spotsold">--</span></p><div id="errors" class="mt-1 text-[10px] text-red-400"></div></div>
 </div>
-<p class="text-[11px] text-gray-500 mt-2">البوت يبيع الضعاف تلقائياً + يراقب AAVE/DOGE/TRX للقمة RSI 70</p>
+</div>
+</div>
+
+<!-- EDITOR TAB -->
+<div id="tab-editor" class="hidden">
+<div class="card rounded-xl p-4 mb-4">
+<h3 class="font-bold mb-3">🔧 محرر الإعدادات الاحترافي - تعديل مباشر من الواجهة</h3>
+<p class="text-[11px] text-gray-400 mb-3">تقدر تغير كل شي بدون ما ترجع Render - التغيير ينحفظ فوراً في config.json والبوت يقرأه تلقائياً</p>
+
+<div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+<div>
+<label class="text-xs text-gray-400">الرافعة المالية</label>
+<input id="cfg_LEVERAGE" type="number" class="w-full bg-[#0a0e14] border border-gray-700 rounded p-2 text-xs mt-1">
+</div>
+<div>
+<label class="text-xs text-gray-400">مخاطرة لكل صفقة (0.01 = 1%)</label>
+<input id="cfg_RISK" type="number" step="0.01" class="w-full bg-[#0a0e14] border border-gray-700 rounded p-2 text-xs mt-1">
+</div>
+<div>
+<label class="text-xs text-gray-400">أقصى صفقات مفتوحة</label>
+<input id="cfg_MAXPOS" type="number" class="w-full bg-[#0a0e14] border border-gray-700 rounded p-2 text-xs mt-1">
+</div>
+<div>
+<label class="text-xs text-gray-400">حد الخسارة اليومي $</label>
+<input id="cfg_DAILYLOSS" type="number" class="w-full bg-[#0a0e14] border border-gray-700 rounded p-2 text-xs mt-1">
+</div>
+<div>
+<label class="text-xs text-gray-400">RSI قمة أولى (بيع 50%)</label>
+<input id="cfg_RSI70" type="number" class="w-full bg-[#0a0e14] border border-gray-700 rounded p-2 text-xs mt-1">
+</div>
+<div>
+<label class="text-xs text-gray-400">RSI قمة نهائية (بيع 100%)</label>
+<input id="cfg_RSI75" type="number" class="w-full bg-[#0a0e14] border border-gray-700 rounded p-2 text-xs mt-1">
+</div>
+<div>
+<label class="text-xs text-gray-400">Take Profit % (0.025 = 2.5%)</label>
+<input id="cfg_TP" type="number" step="0.001" class="w-full bg-[#0a0e14] border border-gray-700 rounded p-2 text-xs mt-1">
+</div>
+<div>
+<label class="text-xs text-gray-400">Stop Loss % (0.011 = 1.1%)</label>
+<input id="cfg_SL" type="number" step="0.001" class="w-full bg-[#0a0e14] border border-gray-700 rounded p-2 text-xs mt-1">
+</div>
+</div>
+
+<div class="mt-4">
+<label class="text-xs text-gray-400">العملات الضعيفة (تنباع تلقائياً) - افصل بفاصلة</label>
+<input id="cfg_WEAK" type="text" class="w-full bg-[#0a0e14] border border-gray-700 rounded p-2 text-xs mt-1 mono" placeholder="SOPH,CORE,XPL,WET,BONK">
+</div>
+<div class="mt-2">
+<label class="text-xs text-gray-400">العملات القوية (تنباع في القمة) - افصل بفاصلة</label>
+<input id="cfg_STRONG" type="text" class="w-full bg-[#0a0e14] border border-gray-700 rounded p-2 text-xs mt-1 mono" placeholder="AAVE,DOGE,TRX">
+</div>
+
+<div class="flex gap-2 mt-4">
+<button onclick="saveCfg()" class="bg-green-600 hover:bg-green-700 px-4 py-2 rounded text-xs font-bold">💾 حفظ التعديلات</button>
+<button onclick="loadCfg()" class="bg-gray-800 px-4 py-2 rounded text-xs">↩️ إلغاء</button>
+<button onclick="viewFullCode()" class="bg-purple-900 px-4 py-2 rounded text-xs">📄 عرض الكود الكامل</button>
+</div>
+<div id="cfgMsg" class="mt-2 text-xs"></div>
 </div>
 
 <div class="card rounded-xl p-4">
-<h3 class="font-bold mb-2">⚙️ تحكم</h3>
-<div class="grid grid-cols-2 gap-2">
-<button onclick="resetDaily()" class="bg-gray-800 hover:bg-gray-700 text-xs px-3 py-2 rounded">إعادة ضبط يومي</button>
-<a href="/trades" target="_blank" class="bg-gray-800 hover:bg-gray-700 text-xs px-3 py-2 rounded text-center">سجل كامل</a>
-<button onclick="load()" class="bg-blue-900 hover:bg-blue-800 text-xs px-3 py-2 rounded col-span-2">تحديث الآن</button>
-</div>
-<div id="stopped" class="hidden mt-3 bg-red-900/30 border border-red-700 p-3 rounded text-xs"></div>
-</div>
-
-<div class="card rounded-xl p-4">
-<h3 class="font-bold mb-2 text-xs">📈 حالة النظام</h3>
-<p class="text-[11px] text-gray-400">فحص: <span id="scanned">--</span> عملة | لفة: <span id="loop">--</span></p>
-<p class="text-[11px] text-gray-400">آخر فحص: <span id="last">--</span></p>
-<p class="text-[11px] text-gray-400">سبوت: <span id="spotsold">--</span></p>
-<div id="errors" class="mt-2 text-[10px] text-red-400"></div>
-</div>
+<h3 class="font-bold text-sm mb-2">📄 محرر الكود الكامل (متقدم)</h3>
+<p class="text-[11px] text-yellow-500 mb-2">⚠️ للمحترفين فقط - تقدر تشوف الكود الحالي. التعديل الكامل يحتاج إعادة Deploy في Render، لكن تعديل الإعدادات فوق يكفي 99% من الحالات</p>
+<textarea id="fullCode" class="w-full h-96 bg-[#0a0e14] border border-gray-700 rounded p-2 text-[10px] mono" readonly>جاري تحميل الكود...</textarea>
 </div>
 </div>
 </div>
 
 <script>
+function showTab(t){
+ document.getElementById('tab-dash').classList.toggle('hidden', t!=='dash');
+ document.getElementById('tab-editor').classList.toggle('hidden', t!=='editor');
+ document.getElementById('btn-dash').className = t==='dash' ? 'bg-blue-600 px-3 py-1 rounded text-xs' : 'bg-gray-800 px-3 py-1 rounded text-xs';
+ document.getElementById('btn-editor').className = t==='editor' ? 'bg-blue-600 px-3 py-1 rounded text-xs' : 'bg-gray-800 px-3 py-1 rounded text-xs';
+ if(t==='editor') loadCfg();
+}
 async function load(){
  try{
-  const res = await fetch('/api/status');
-  const d = await res.json();
+  const res = await fetch('/api/status'); const d = await res.json();
   document.getElementById('balance').textContent = d.balance + ' USDT';
-  document.getElementById('balance').className = 'text-xl font-bold ' + (d.balance<5?'text-red-400':'text-green-400');
-  const dailyEl = document.getElementById('daily');
-  dailyEl.textContent = (d.daily_pnl>=0?'+':'') + d.daily_pnl + ' $';
-  dailyEl.className = 'text-xl font-bold ' + (d.daily_pnl>=0?'text-green-400':'text-red-400');
+  document.getElementById('daily').textContent = (d.daily_pnl>=0?'+':'') + d.daily_pnl + ' $';
+  document.getElementById('daily').className = 'text-lg font-bold ' + (d.daily_pnl>=0?'text-green-400':'text-red-400');
   document.getElementById('open').textContent = d.open_count + ' / ' + d.max_positions;
   document.getElementById('btc').textContent = d.btc_trend + ' | ' + d.btc_vol;
-  document.getElementById('btcvol').textContent = d.btc_vol;
-  document.getElementById('consec').textContent = d.consecutive_losses + ' / ' + d.max_consecutive;
+  document.getElementById('consec').textContent = d.consecutive_losses + ' / 3';
   document.getElementById('scanned').textContent = d.scanned;
   document.getElementById('loop').textContent = d.loop;
   document.getElementById('last').textContent = d.last_scan ? new Date(d.last_scan).toLocaleTimeString('ar-SA') : '--';
-  document.getElementById('spotsold').textContent = (d.spot_sold||[]).join(', ') || 'لم يبع بعد';
-
+  document.getElementById('spotsold').textContent = (d.spot_sold||[]).join(', ') || 'لم يبع';
   const stoppedDiv = document.getElementById('stopped');
-  if(d.stopped){ stoppedDiv.classList.remove('hidden'); stoppedDiv.textContent = '⛔ متوقف: ' + d.stopped_reason; document.getElementById('status-text').textContent='متوقف'; document.getElementById('status-dot').className='w-3 h-3 bg-red-500 rounded-full mt-2'; } else { stoppedDiv.classList.add('hidden'); document.getElementById('status-text').textContent='يعمل'; document.getElementById('status-dot').className='w-3 h-3 bg-green-500 rounded-full animate-pulse mt-2'; }
-
-  // positions
+  if(d.stopped){ stoppedDiv.classList.remove('hidden'); stoppedDiv.textContent = '⛔ متوقف: ' + d.stopped_reason; document.getElementById('status-dot').className='w-3 h-3 bg-red-500 rounded-full mt-2'; } else { stoppedDiv.classList.add('hidden'); document.getElementById('status-dot').className='w-3 h-3 bg-green-500 rounded-full animate-pulse mt-2'; }
   const posDiv = document.getElementById('positions');
-  if(d.positions && d.positions.length>0){
-   posDiv.innerHTML = d.positions.map(p=>{
-    const pnlClass = p.pnl>=0?'text-green-400':'text-red-400';
-    return `<div class="bg-[#0a0e14] border border-gray-800 rounded p-3 flex justify-between"><div><p class="font-bold text-sm">${p.symbol} <span class="text-xs ${p.side=='long'?'text-green-400':'text-red-400'}">${p.side}</span></p><p class="text-[11px] text-gray-400">دخول: ${p.entry}</p></div><div class="text-left"><p class="font-bold ${pnlClass}">${p.pnl} $</p><p class="text-[10px] text-green-500">✓ SL محمي</p></div></div>`;
-   }).join('');
-  } else { posDiv.innerHTML = '<p class="text-gray-500 text-sm">لا يوجد صفقات - ينتظر إشارة GOD 7/10<br><span class="text-[11px]">لا يفتح إذا BTC متقلب + يمنع عملات مرتبطة</span></p>'; }
-
-  // signals
+  if(d.positions && d.positions.length>0){ posDiv.innerHTML = d.positions.map(p=>{ const pnlClass = p.pnl>=0?'text-green-400':'text-red-400'; return `<div class="bg-[#0a0e14] border border-gray-800 rounded p-2 flex justify-between"><div><p class="font-bold">${p.symbol} <span class="text-[10px] ${p.side=='long'?'text-green-400':'text-red-400'}">${p.side}</span></p><p class="text-[10px] text-gray-400">دخول: ${p.entry}</p></div><div class="text-left"><p class="font-bold ${pnlClass}">${p.pnl} $</p><p class="text-[9px] text-green-500">✓ SL</p></div></div>`; }).join(''); } else { posDiv.innerHTML = '<p class="text-gray-500">لا صفقات - ينتظر GOD 7/10</p>'; }
   const sigDiv = document.getElementById('signals');
-  if(d.signals && d.signals.length>0){
-   sigDiv.innerHTML = d.signals.map(s=>`<div class="flex justify-between bg-[#0a0e14] rounded p-2 text-xs"><span>${s.symbol} ${s.direction} RSI:${s.rsi}</span><span class="bg-blue-900 px-2 rounded">${s.score}/10</span></div>`).join('');
-  } else { sigDiv.innerHTML = '<p class="text-gray-500 text-sm">لا إشارات قوية حالياً - البوت لا يفتح إلا 7/10</p>'; }
-
-  // errors
+  if(d.signals && d.signals.length>0){ sigDiv.innerHTML = d.signals.map(s=>`<div class="flex justify-between bg-[#0a0e14] rounded p-2"><span>${s.symbol} ${s.direction} RSI:${s.rsi}</span><span class="bg-blue-900 px-2 rounded">${s.score}/10</span></div>`).join(''); } else { sigDiv.innerHTML = '<p class="text-gray-500">لا إشارات قوية</p>'; }
   document.getElementById('errors').textContent = (d.errors||[]).join(' | ');
-
-  // spot
-  const spotRes = await fetch('/api/spot');
-  const spotData = await spotRes.json();
+  const spotRes = await fetch('/api/spot'); const spotData = await spotRes.json();
   const spotDiv = document.getElementById('spot');
-  if(spotData.holdings){
-   spotDiv.innerHTML = spotData.holdings.map(h=>{
-    const adviceClass = h.advice.includes('بيع')?'text-yellow-400':'text-green-400';
-    return `<div class="bg-[#0a0e14] border border-gray-800 rounded p-2"><div class="flex justify-between"><span class="font-bold text-xs">${h.coin}</span><span class="text-xs">${h.value_usdt}$</span></div><p class="text-[11px] text-gray-400">${h.trend} RSI:${h.rsi||'--'}</p><p class="text-[11px] ${adviceClass}">${h.advice}</p></div>`;
-   }).join('') + `<p class="text-[11px] text-gray-500 mt-2">الإجمالي: ${spotData.total_spot_value}$</p>`;
-  }
-
-  // trades
-  const tradesRes = await fetch('/trades');
-  const tradesData = await tradesRes.json();
-  const tradesDiv = document.getElementById('trades');
-  tradesDiv.innerHTML = tradesData.slice(-10).reverse().map(t=>{
-   const color = t.type.includes('ENTRY')?'text-blue-400': t.pnl>0?'text-green-400':'text-red-400';
-   const txt = t.type + ' ' + (t.symbol||'') + (t.pnl!=undefined?' PnL:'+t.pnl:'') + (t.value?' '+t.value.toFixed(2)+'$':'');
-   return `<p class="${color}">${new Date(t.time).toLocaleTimeString('ar-SA')} - ${txt}</p>`;
-  }).join('') || '<p class="text-gray-500">لا سجل</p>';
-
- }catch(e){ console.log(e); }
+  if(spotData.holdings){ spotDiv.innerHTML = spotData.holdings.map(h=>{ const adviceClass = h.advice.includes('بيع')?'text-yellow-400':'text-green-400'; return `<div class="bg-[#0a0e14] border border-gray-800 rounded p-2"><div class="flex justify-between"><span class="font-bold">${h.coin}</span><span>${h.value_usdt}$</span></div><p class="text-[11px] text-gray-400">${h.trend} RSI:${h.rsi||'--'}</p><p class="text-[11px] ${adviceClass}">${h.advice}</p></div>`; }).join('') + `<p class="text-[11px] text-gray-500 mt-2">الإجمالي: ${spotData.total_spot_value}$</p>`; }
+  const tradesRes = await fetch('/trades'); const tradesData = await tradesRes.json();
+  document.getElementById('trades').innerHTML = tradesData.slice(-10).reverse().map(t=>{ const color = t.type.includes('ENTRY')?'text-blue-400': t.pnl>0?'text-green-400':'text-red-400'; return `<p class="${color}">${new Date(t.time).toLocaleTimeString('ar-SA')} - ${t.type} ${t.symbol||''} ${t.pnl!=undefined?'PnL:'+t.pnl:''}</p>`; }).join('') || '<p class="text-gray-500">لا سجل</p>';
+ }catch(e){}
 }
-async function forceSell(){ if(!confirm('بيع العملات الضعيفة SOPH/CORE/XPL/WET الآن؟')) return; const r=await fetch('/spot/force_sell_weak'); const d=await r.json(); alert('تم: '+(d.sold_now||[]).join(', ')); load(); }
-async function resetDaily(){ if(!confirm('إعادة ضبط الخسارة اليومية؟')) return; await fetch('/reset_daily'); load(); }
+async function forceSell(){ if(!confirm('بيع الضعاف؟')) return; const r=await fetch('/spot/force_sell_weak'); const d=await r.json(); alert('تم: '+(d.sold_now||[]).join(', ')); load(); }
+async function resetDaily(){ if(!confirm('إعادة ضبط؟')) return; await fetch('/reset_daily'); load(); }
+
+// EDITOR FUNCS
+async function loadCfg(){
+ const r = await fetch('/api/config'); const c = await r.json();
+ document.getElementById('cfg_LEVERAGE').value = c.LEVERAGE;
+ document.getElementById('cfg_RISK').value = c.RISK_PER_TRADE;
+ document.getElementById('cfg_MAXPOS').value = c.MAX_POSITIONS;
+ document.getElementById('cfg_DAILYLOSS').value = c.DAILY_LOSS_LIMIT;
+ document.getElementById('cfg_RSI70').value = c.SPOT_SELL_RSI_PEAK;
+ document.getElementById('cfg_RSI75').value = c.SPOT_SELL_RSI_TOP;
+ document.getElementById('cfg_TP').value = c.TAKE_PROFIT;
+ document.getElementById('cfg_SL').value = c.STOP_LOSS;
+ document.getElementById('cfg_WEAK').value = (c.SPOT_WEAK_COINS||[]).join(',');
+ document.getElementById('cfg_STRONG').value = (c.SPOT_STRONG_COINS||[]).join(',');
+}
+async function saveCfg(){
+ const newCfg = {
+  LEVERAGE: parseFloat(document.getElementById('cfg_LEVERAGE').value),
+  RISK_PER_TRADE: parseFloat(document.getElementById('cfg_RISK').value),
+  MAX_POSITIONS: parseInt(document.getElementById('cfg_MAXPOS').value),
+  DAILY_LOSS_LIMIT: parseFloat(document.getElementById('cfg_DAILYLOSS').value),
+  SPOT_SELL_RSI_PEAK: parseFloat(document.getElementById('cfg_RSI70').value),
+  SPOT_SELL_RSI_TOP: parseFloat(document.getElementById('cfg_RSI75').value),
+  TAKE_PROFIT: parseFloat(document.getElementById('cfg_TP').value),
+  STOP_LOSS: parseFloat(document.getElementById('cfg_SL').value),
+  SPOT_WEAK_COINS: document.getElementById('cfg_WEAK').value.split(',').map(s=>s.trim().toUpperCase()).filter(s=>s),
+  SPOT_STRONG_COINS: document.getElementById('cfg_STRONG').value.split(',').map(s=>s.trim().toUpperCase()).filter(s=>s),
+ };
+ const r = await fetch('/api/config', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(newCfg)});
+ const d = await r.json();
+ document.getElementById('cfgMsg').textContent = d.ok ? '✅ تم الحفظ - البوت سيقرأ الإعدادات الجديدة في اللفة الجاية (25 ثانية)' : '❌ خطأ: '+d.error;
+ document.getElementById('cfgMsg').className = 'mt-2 text-xs ' + (d.ok ? 'text-green-400' : 'text-red-400');
+}
+async function viewFullCode(){
+ const r = await fetch('/api/code'); const d = await r.json();
+ document.getElementById('fullCode').value = d.code || 'غير متوفر';
+}
 load(); setInterval(load, 10000);
 </script>
 </body>
@@ -527,7 +586,7 @@ def dashboard():
 def api_status():
     total,cnt,pos,syms=get_positions()
     return jsonify({
-        "bot":"V100000 DASHBOARD",
+        "bot":"V100000 EDITOR",
         "balance":round(get_free_usdt(),4),
         "btc_trend":state["btc_trend"],
         "btc_vol":f"{state['btc_vol']}%",
@@ -538,7 +597,6 @@ def api_status():
         "daily_pnl":state["daily_pnl"],
         "daily_limit":-CONFIG["DAILY_LOSS_LIMIT"],
         "consecutive_losses":state["consecutive_losses"],
-        "max_consecutive":CONFIG["MAX_CONSECUTIVE_LOSSES"],
         "stopped":state["stopped_by_loss"],
         "stopped_reason":state["stopped_reason"],
         "risk":f"{CONFIG['RISK_PER_TRADE']*100}%",
@@ -583,8 +641,39 @@ def api_spot():
     except Exception as e:
         return jsonify({"error":str(e)})
 
+@app.route("/api/config", methods=["GET","POST"])
+def api_config():
+    if request.method=="GET":
+        return jsonify(CONFIG)
+    else:
+        try:
+            data=request.get_json()
+            # حماية: لا نسمح بتغيير ملفات
+            allowed=["LEVERAGE","RISK_PER_TRADE","MAX_POSITIONS","DAILY_LOSS_LIMIT","SPOT_SELL_RSI_PEAK","SPOT_SELL_RSI_TOP","TAKE_PROFIT","STOP_LOSS","SPOT_WEAK_COINS","SPOT_STRONG_COINS"]
+            new_cfg={}
+            for k in allowed:
+                if k in data:
+                    new_cfg[k]=data[k]
+            # حفظ
+            ok=save_config(new_cfg)
+            return jsonify({"ok":ok,"saved":new_cfg})
+        except Exception as e:
+            return jsonify({"ok":False,"error":str(e)})
+
+@app.route("/api/code")
+def api_code():
+    try:
+        with open(__file__,"r",encoding="utf-8",errors="ignore") as f:
+            code=f.read()
+        # نقطع الكود لو كبير جدا
+        if len(code)>15000:
+            code=code[:15000]+"\n\n... الكود طويل جدا، تم اقتطاعه - التعديل الحقيقي يكون عبر الإعدادات فوق"
+        return jsonify({"code":code})
+    except Exception as e:
+        return jsonify({"code":f"خطأ قراءة الكود: {e}"})
+
 @app.route("/ping")
-def ping(): return jsonify({"pong":True,"loop":state["loop"],"daily_pnl":state["daily_pnl"]})
+def ping(): return jsonify({"pong":True,"loop":state["loop"]})
 
 @app.route("/trades")
 def trades(): return jsonify(load_trades()[-50:])
