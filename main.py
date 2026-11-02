@@ -1,7 +1,7 @@
 import os, time, json, logging, threading
 from datetime import datetime, timezone, date
 import ccxt, pandas as pd
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify
 import numpy as np
 
 CONFIG = {
@@ -12,18 +12,13 @@ CONFIG = {
     "TIMEFRAME_HTF": "1h",
     "CANDLE_LIMIT": 300,
     "SCAN_INTERVAL": 25,
-    "TAKE_PROFIT": 0.025,
     "STOP_LOSS": 0.011,
-    "DAILY_LOSS_LIMIT": 4.0,
-    "MAX_CONSECUTIVE_LOSSES": 3,
+    "MAX_CONSECUTIVE_LOSSES": 2,
+    "DAILY_LOSS_LIMIT": 2.5,
     "BTC_VOLATILITY_LIMIT": 0.04,
     "STATE_FILE": "bot_state.json",
     "TRADES_FILE": "trades_log.json",
-    "CONFIG_FILE": "config.json",
     "TRAILING_ENABLED": True,
-    "TRAILING_BE": 0.8,
-    "TRAILING_LOCK1": 1.5,
-    "TRAILING_LOCK2": 2.5,
 }
 
 API_KEY=os.getenv("OKX_API_KEY","").strip()
@@ -31,7 +26,7 @@ API_SECRET=os.getenv("OKX_API_SECRET","").strip() or os.getenv("OKX_SECRET","").
 API_PASSWORD=os.getenv("OKX_API_PASSWORD","").strip() or os.getenv("OKX_PASSPHRASE","").strip()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
-log=logging.getLogger("V100003-TRAILING")
+log=logging.getLogger("FINAL")
 app=Flask(__name__)
 exchange=ccxt.okx({"apiKey":API_KEY,"secret":API_SECRET,"password":API_PASSWORD,"enableRateLimit":True,"options":{"defaultType":"swap"}})
 
@@ -46,17 +41,13 @@ state={
     "daily_pnl": saved.get("daily_pnl",0.0) if saved.get("daily_date")==str(date.today()) else 0.0,
     "daily_date": str(date.today()),
     "consecutive_losses": saved.get("consecutive_losses",0),
-    "stopped_by_loss": False,"stopped_reason": "",
-    "open_trades": saved.get("open_trades",{}),
-    "spot_sold": saved.get("spot_sold",[]),
-    "auto_mode":"🛡️ حماية","auto_risk":0.01,"auto_lev":3,
-    "emergency_closes":0,
+    "stopped_by_loss": False,"open_trades": saved.get("open_trades",{}),
 }
 
 def save_state():
     try:
         with open(CONFIG["STATE_FILE"],"w") as f:
-            json.dump({"daily_pnl":state["daily_pnl"],"daily_date":state["daily_date"],"consecutive_losses":state["consecutive_losses"],"open_trades":state["open_trades"],"spot_sold":state["spot_sold"]}, f)
+            json.dump({"daily_pnl":state["daily_pnl"],"daily_date":state["daily_date"],"consecutive_losses":state["consecutive_losses"],"open_trades":state["open_trades"]}, f)
     except: pass
 def load_trades():
     try:
@@ -93,9 +84,9 @@ def get_all_equity_breakdown():
 def get_auto_config():
     eq=get_all_equity_breakdown()
     total=eq["total"]
-    if total < 50: return {"RISK":0.01, "LEV":3, "TP":0.025, "MAX":2, "MODE":"🛡️ حماية", "TOTAL":total, "EQ":eq, "NEXT":50-total}
-    elif total < 100: return {"RISK":0.015, "LEV":4, "TP":0.03, "MAX":2, "MODE":"🚀 نمو", "TOTAL":total, "EQ":eq, "NEXT":100-total}
-    else: return {"RISK":0.02, "LEV":5, "TP":0.035, "MAX":3, "MODE":"🔥 تعويض", "TOTAL":total, "EQ":eq, "NEXT":0}
+    if total < 50: return {"RISK":0.01, "LEV":3, "TP":0.025, "MAX":2, "MODE":"🛡️ حماية", "TOTAL":total, "EQ":eq}
+    elif total < 100: return {"RISK":0.015, "LEV":4, "TP":0.03, "MAX":2, "MODE":"🚀 نمو", "TOTAL":total, "EQ":eq}
+    else: return {"RISK":0.02, "LEV":5, "TP":0.035, "MAX":3, "MODE":"🔥 تعويض", "TOTAL":total, "EQ":eq}
 def calc_margin(price):
     try:
         cfg=get_auto_config()
@@ -104,7 +95,6 @@ def calc_margin(price):
         risk_usd=bal*cfg["RISK"]
         margin_needed=risk_usd/CONFIG["STOP_LOSS"]
         margin=margin_needed/cfg["LEV"]
-        state["auto_mode"]=cfg["MODE"]; state["auto_risk"]=cfg["RISK"]; state["auto_lev"]=cfg["LEV"]
         return round(max(2.0,min(margin,6.0)),2)
     except: return 2.5
 def get_targets(entry,direction):
@@ -140,44 +130,41 @@ def fetch_df(symbol, tf):
         avg_gain=gain.ewm(alpha=1/14,adjust=False).mean(); avg_loss=loss.ewm(alpha=1/14,adjust=False).mean()
         rs=avg_gain/avg_loss.replace(0,1e-8); df["rsi"]=100-(100/(1+rs))
         df["vol_avg"]=df["volume"].rolling(20).mean(); df["atr"]=calc_true_atr(df,14)
-        df["bb_mid"]=df["close"].rolling(20).mean()
         return df.dropna()
     except: return None
 def get_btc_status():
     try:
         df=fetch_df("BTC/USDT", CONFIG["TIMEFRAME"])
-        if df is None: return "neutral",0, {}
+        if df is None: return "neutral",0
         curr=df.iloc[-1]
         atr_pct=curr["atr"]/curr["close"]
-        info={"rsi":curr["rsi"],"close":curr["close"]}
         if curr["close"]>curr["ema200"] and curr["ema9"]>curr["ema21"]: trend="bull"
         elif curr["close"]<curr["ema200"] and curr["ema9"]<curr["ema21"]: trend="bear"
         else: trend="neutral"
-        return trend, atr_pct, info
-    except: return "neutral",0, {}
-def analyze(symbol, btc_trend, btc_info):
+        return trend, atr_pct
+    except: return "neutral",0
+def analyze(symbol, btc_trend):
     try:
-        df=fetch_df(symbol, CONFIG["TIMEFRAME"]); df_h=fetch_df(symbol, CONFIG["TIMEFRAME_HTF"])
+        df=fetch_df(symbol, CONFIG["TIMEFRAME"])
+        df_h=fetch_df(symbol, CONFIG["TIMEFRAME_HTF"])
         if df is None or df_h is None: return None
-        curr=df.iloc[-1]; prev=df.iloc[-2]
-        if curr["volume"] < curr["vol_avg"]*1.3: return None
+        curr=df.iloc[-1]; curr_h=df_h.iloc[-1]; prev=df.iloc[-2]
+        if curr["volume"] < curr["vol_avg"]*1.2: return None
         atr_pct=curr["atr"]/curr["close"]
         if atr_pct > 0.05 or atr_pct < 0.0008: return None
         score=0; direction=None
         if curr["ema9"]>curr["ema21"]>curr["ema50"] and curr["close"]>curr["ema200"]:
-            if 48 < curr["rsi"] < 72:
-                if curr_h["ema9"]<curr_h["ema21"] and btc_trend=="bear": return None
+            if 48 < curr["rsi"] < 70:
+                if curr_h["close"] < curr_h["ema200"] and btc_trend=="bear": return None
                 score+=6
                 if prev["ema9"]<=prev["ema21"] and curr["ema9"]>curr["ema21"]: score+=3
-                if 55 < curr["rsi"] < 68: score+=1
                 if btc_trend=="bull": score+=1
                 direction="long"
         if curr["ema9"]<curr["ema21"]<curr["ema50"] and curr["close"]<curr["ema200"]:
-            if 28 < curr["rsi"] < 52:
-                if curr_h["ema9"]>curr_h["ema21"] and btc_trend=="bull": return None
+            if 28 < curr["rsi"] < 50:
+                if curr_h["close"] > curr_h["ema200"] and btc_trend=="bull": return None
                 s_score=6
                 if prev["ema9"]>=prev["ema21"] and curr["ema9"]<curr["ema21"]: s_score+=3
-                if 32 < curr["rsi"] < 45: s_score+=1
                 if btc_trend=="bear": s_score+=1
                 if s_score>score:
                     score=s_score; direction="short"
@@ -198,19 +185,7 @@ def verify_sl(swap):
                 if p.get("stopLossPrice") or float(p.get("info",{}).get("stopLossPrice") or 0)>0: return True
         return False
     except: return False
-def emergency_close(swap, direction, amount, reason):
-    try:
-        pos_check = exchange.fetch_positions([swap])
-        has_pos = any(float(p.get("contracts") or 0)>0 for p in pos_check)
-        if not has_pos: return False
-        side_close="sell" if direction=="long" else "buy"; posSide="long" if direction=="long" else "short"
-        exchange.create_order(swap,"market",side_close,amount,None,{"tdMode":"isolated","posSide":posSide})
-        state["emergency_closes"]+=1
-        save_trade_log({"time":datetime.now(timezone.utc).isoformat(),"type":"EMERGENCY_CLOSE","symbol":swap,"reason":reason})
-        return True
-    except: return False
 
-# === تريلينق يأمن الربح ===
 def local_protection_loop():
     while state["running"]:
         try:
@@ -223,59 +198,32 @@ def local_protection_loop():
                 direction=trade["direction"]
                 amount=float(p.get("contracts") or trade.get("amount") or 0)
                 if amount==0: continue
-                mark=float(p.get("markPrice") or p.get("lastPrice") or entry)
+                mark=float(p.get("markPrice") or entry)
                 lev=get_auto_config()["LEV"]
-                if direction=="short":
-                    pnl_pct = (entry - mark) / entry * 100 * lev
-                else:
-                    pnl_pct = (mark - entry) / entry * 100 * lev
-                
-                # حماية خسارة
-                sl_price = entry*(1-CONFIG["STOP_LOSS"]) if direction=="long" else entry*(1+CONFIG["STOP_LOSS"])
-                if direction=="long" and mark <= sl_price*0.997:
-                    emergency_close(symbol, direction, amount, f"SL HIT {pnl_pct:.2f}%")
-                    continue
-                if direction=="short" and mark >= sl_price*1.003:
-                    emergency_close(symbol, direction, amount, f"SL HIT {pnl_pct:.2f}%")
-                    continue
-
-                # تريلينق - يأمن الربح
-                if not CONFIG["TRAILING_ENABLED"]: continue
-                sl_moved=trade.get("sl_moved",0)
-                if pnl_pct >= CONFIG["TRAILING_BE"] and sl_moved < 1:
+                pnl_pct = (entry - mark)/entry*100*lev if direction=="short" else (mark-entry)/entry*100*lev
+                if pnl_pct >= 0.8 and trade.get("sl_moved",0) < 1:
                     new_sl = entry * 1.0005 if direction=="short" else entry * 0.9995
                     try:
-                        posSide="short" if direction=="short" else "long"
-                        exchange.create_order(symbol,"market","buy" if direction=="short" else "sell",amount,None,{"tdMode":"isolated","posSide":posSide,"stopLoss":{"triggerPrice":new_sl,"orderPrice":"-1"}})
-                        trade["sl_moved"]=1
-                        trade["locked"]=0.0
-                        save_trade_log({"time":datetime.now(timezone.utc).isoformat(),"type":"TRAIL_BE","symbol":symbol,"pnl":pnl_pct})
-                        log.info(f"✅ أمن راس المال {symbol} +{pnl_pct:.2f}%")
-                    except Exception as e: log.info(f"trail BE fail {e}")
-                elif pnl_pct >= CONFIG["TRAILING_LOCK1"] and sl_moved < 2:
+                        exchange.create_order(symbol,"market","buy" if direction=="short" else "sell",amount,None,{"tdMode":"isolated","posSide":direction,"stopLoss":{"triggerPrice":new_sl,"orderPrice":"-1"}})
+                        trade["sl_moved"]=1; save_state()
+                        log.info(f"BE SECURED {symbol} {pnl_pct:.2f}%")
+                    except: pass
+                elif pnl_pct >= 1.5 and trade.get("sl_moved",0) < 2:
                     new_sl = entry * (1 - 0.007) if direction=="short" else entry * (1 + 0.007)
                     try:
-                        posSide="short" if direction=="short" else "long"
-                        exchange.create_order(symbol,"market","buy" if direction=="short" else "sell",amount,None,{"tdMode":"isolated","posSide":posSide,"stopLoss":{"triggerPrice":new_sl,"orderPrice":"-1"}})
-                        trade["sl_moved"]=2
-                        trade["locked"]=0.7
-                        save_trade_log({"time":datetime.now(timezone.utc).isoformat(),"type":"TRAIL_LOCK_0.7","symbol":symbol,"pnl":pnl_pct})
-                        log.info(f"🔒 أمن ربح 0.7% {symbol}")
+                        exchange.create_order(symbol,"market","buy" if direction=="short" else "sell",amount,None,{"tdMode":"isolated","posSide":direction,"stopLoss":{"triggerPrice":new_sl,"orderPrice":"-1"}})
+                        trade["sl_moved"]=2; save_state()
+                        log.info(f"LOCK 0.7% {symbol}")
                     except: pass
-                elif pnl_pct >= CONFIG["TRAILING_LOCK2"] and sl_moved < 3:
+                elif pnl_pct >= 2.5 and trade.get("sl_moved",0) < 3:
                     new_sl = entry * (1 - 0.015) if direction=="short" else entry * (1 + 0.015)
                     try:
-                        posSide="short" if direction=="short" else "long"
-                        exchange.create_order(symbol,"market","buy" if direction=="short" else "sell",amount,None,{"tdMode":"isolated","posSide":posSide,"stopLoss":{"triggerPrice":new_sl,"orderPrice":"-1"}})
-                        trade["sl_moved"]=3
-                        trade["locked"]=1.5
-                        save_trade_log({"time":datetime.now(timezone.utc).isoformat(),"type":"TRAIL_LOCK_1.5","symbol":symbol,"pnl":pnl_pct})
-                        log.info(f"🔒🔒 أمن ربح 1.5% {symbol} ويترك الباقي يطير")
+                        exchange.create_order(symbol,"market","buy" if direction=="short" else "sell",amount,None,{"tdMode":"isolated","posSide":direction,"stopLoss":{"triggerPrice":new_sl,"orderPrice":"-1"}})
+                        trade["sl_moved"]=3; save_state()
+                        log.info(f"LOCK 1.5% {symbol}")
                     except: pass
-                save_state()
             time.sleep(8)
-        except Exception as e:
-            time.sleep(10)
+        except: time.sleep(10)
 
 def place_trade(signal):
     total, cnt, _, open_syms = get_positions()
@@ -294,16 +242,17 @@ def place_trade(signal):
         order=exchange.create_order(swap,"market",side,amount,None,{"tdMode":"isolated","posSide":posSide,"lever":str(cfg["LEV"])})
         avg=float(order.get("average") or signal["price"]); filled=float(order.get("filled") or amount)
         t=get_targets(avg, signal["direction"])
-        for attempt in range(3):
+        for _ in range(3):
             try:
                 exchange.create_order(swap, "market", "sell" if signal["direction"]=="long" else "buy", filled, None, {"tdMode":"isolated","posSide":posSide,"stopLoss":{"triggerPrice":t["sl"],"orderPrice":"-1"}})
                 time.sleep(1)
                 if verify_sl(swap): break
             except: time.sleep(1)
-        state["open_trades"][swap]={"entry":avg,"direction":signal["direction"],"margin":margin,"amount":filled,"time":datetime.now(timezone.utc).isoformat(),"sl":t["sl"],"tp":t["tp"],"sl_moved":0,"locked":0}
+        state["open_trades"][swap]={"entry":avg,"direction":signal["direction"],"margin":margin,"amount":filled,"sl_moved":0}
         save_state()
-        save_trade_log({"time":datetime.now(timezone.utc).isoformat(),"type":"ENTRY","symbol":swap,"direction":signal["direction"],"entry":avg,"margin":margin,"score":signal["score"],"mode":cfg["MODE"]})
+        save_trade_log({"time":datetime.now(timezone.utc).isoformat(),"type":"ENTRY","symbol":swap,"direction":signal["direction"],"entry":avg})
     except Exception as e: state["errors"].append(str(e)[-150:])
+
 def check_closed_and_update_pnl():
     try:
         today=str(date.today())
@@ -323,22 +272,23 @@ def check_closed_and_update_pnl():
                     state["daily_pnl"]=round(state["daily_pnl"]+pnl,4)
                     if pnl<0: state["consecutive_losses"]+=1
                     else: state["consecutive_losses"]=0
-                    save_trade_log({"time":datetime.now(timezone.utc).isoformat(),"type":"EXIT","symbol":sym,"pnl":pnl,"daily_pnl":state["daily_pnl"]})
+                    save_trade_log({"time":datetime.now(timezone.utc).isoformat(),"type":"EXIT","symbol":sym,"pnl":pnl})
                 del state["open_trades"][sym]; save_state()
             except: 
                 try: del state["open_trades"][sym]
                 except: pass
         if state["daily_pnl"] <= -CONFIG["DAILY_LOSS_LIMIT"]:
-            state["stopped_by_loss"]=True; state["stopped_reason"]=f"DAILY LOSS {state['daily_pnl']}$"
+            state["stopped_by_loss"]=True
         if state["consecutive_losses"] >= CONFIG["MAX_CONSECUTIVE_LOSSES"]:
-            state["stopped_by_loss"]=True; state["stopped_reason"]=f"{state['consecutive_losses']} LOSSES IN ROW"
+            state["stopped_by_loss"]=True
     except: pass
+
 def scan_and_trade():
     try: exchange.load_markets()
     except: pass
     check_closed_and_update_pnl()
     if state["stopped_by_loss"]: return
-    btc_trend, btc_vol, btc_info = get_btc_status()
+    btc_trend, btc_vol = get_btc_status()
     state["btc_trend"]=btc_trend; state["btc_vol"]=round(btc_vol*100,2)
     if btc_vol > CONFIG["BTC_VOLATILITY_LIMIT"]: return
     cfg=get_auto_config()
@@ -347,9 +297,9 @@ def scan_and_trade():
     signals=[]; scanned=0
     TOP_COINS = ["BTC/USDT","ETH/USDT","SOL/USDT","AVAX/USDT","LINK/USDT","ADA/USDT","LTC/USDT","DOT/USDT","ARB/USDT","ENA/USDT","FET/USDT","TAO/USDT","RENDER/USDT","SUI/USDT","SEI/USDT","APT/USDT","NEAR/USDT","OP/USDT"]
     for s in TOP_COINS:
-        base=s.split("/")[0]; swap=base+"/USDT:USDT"
+        base=s.split("/")[0]
         if any(base in sym for sym in open_syms): continue
-        sig=analyze(s, btc_trend, btc_info); scanned+=1
+        sig=analyze(s, btc_trend); scanned+=1
         if sig: signals.append(sig)
         time.sleep(0.15)
     signals.sort(key=lambda x:x["score"],reverse=True)
@@ -364,24 +314,20 @@ def run_bot():
 
 DASHBOARD_HTML = """
 <!DOCTYPE html><html lang="ar" dir="rtl"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>V100003 TRAILING</title><script src="https://cdn.tailwindcss.com"></script>
+<title>FINAL TRAILING</title><script src="https://cdn.tailwindcss.com"></script>
 <style>body{background:#0a0e14;color:#e5e7eb}.card{background:#111827;border:1px solid #1f2937}</style>
 </head><body class="p-3"><div class="max-w-7xl mx-auto">
-<div class="flex justify-between mb-4"><h1 class="text-xl font-bold">V100003 <span class="text-green-400">TRAILING يأمن الربح 🔒</span></h1><span class="w-3 h-3 bg-green-500 rounded-full animate-pulse mt-2"></span></div>
-<div class="card rounded-xl p-3 mb-4 bg-gradient-to-r from-green-900/30 to-blue-900/30 border-green-800">
-<p class="text-xs">🎯 كل ما ربح يأمن: 0.8% = رأس مال | 1.5% = +0.7% مضمون | 2.5% = +1.5% مضمون ويترك الباقي يطير 🚀</p>
-</div>
+<div class="flex justify-between mb-4"><h1 class="text-xl font-bold">FINAL <span class="text-green-400">TRAILING 🔒</span></h1><span class="w-3 h-3 bg-green-500 rounded-full animate-pulse mt-2"></span></div>
 <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
-<div class="card rounded-xl p-3"><p class="text-[11px] text-gray-400">فيوتشر حر</p><p id="balance" class="text-lg font-bold">--</p></div>
+<div class="card rounded-xl p-3"><p class="text-[11px] text-gray-400">فيوتشر</p><p id="balance" class="text-lg font-bold">--</p></div>
 <div class="card rounded-xl p-3"><p class="text-[11px] text-gray-400">ربح اليوم</p><p id="daily" class="text-lg font-bold">--</p></div>
 <div class="card rounded-xl p-3"><p class="text-[11px] text-gray-400">صفقات</p><p id="open" class="text-lg font-bold">--</p></div>
 <div class="card rounded-xl p-3"><p class="text-[11px] text-gray-400">BTC</p><p id="btc" class="text-xs font-bold">--</p></div>
 </div>
 <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
-<div class="card rounded-xl p-4"><h3 class="font-bold text-sm mb-2">📊 صفقات + تريلينق</h3><div id="positions" class="space-y-2 text-xs"></div></div>
-<div class="card rounded-xl p-4"><h3 class="font-bold text-sm mb-2">🎯 إشارات</h3><div id="signals" class="space-y-2 text-xs"></div></div>
+<div class="card rounded-xl p-4"><h3 class="font-bold text-sm mb-2">صفقات</h3><div id="positions" class="space-y-2 text-xs"></div></div>
+<div class="card rounded-xl p-4"><h3 class="font-bold text-sm mb-2">إشارات</h3><div id="signals" class="space-y-2 text-xs"></div></div>
 </div>
-<div class="card rounded-xl p-4 mt-4"><h3 class="font-bold text-sm mb-2">📜 سجل التريلينق</h3><div id="trades" class="space-y-1 text-[11px] max-h-40 overflow-y-auto"></div></div>
 </div>
 <script>
 async function load(){
@@ -390,16 +336,12 @@ async function load(){
   document.getElementById('balance').textContent = d.futures_free.toFixed(2) + ' USDT';
   document.getElementById('daily').textContent = d.daily_pnl + ' $';
   document.getElementById('open').textContent = d.open_count + ' / ' + d.max_positions;
-  document.getElementById('btc').textContent = d.btc_trend + ' | ATR:' + d.btc_vol;
+  document.getElementById('btc').textContent = d.btc_trend;
   const posDiv = document.getElementById('positions');
-  if(d.positions && d.positions.length>0){ posDiv.innerHTML = d.positions.map(p=>{ 
-    const trail = p.locked>0 ? `🔒 مأمن ${p.locked}%` : p.sl_moved==1 ? '✅ رأس مال مأمن' : '⏳';
-    return `<div class="bg-[#0a0e14] border border-gray-800 rounded p-2 flex justify-between"><div><p class="font-bold">${p.symbol} ${p.side}</p><p class="text-[10px] text-gray-400">دخول: ${p.entry}</p></div><div class="text-left"><p class="font-bold ${p.pnl>=0?'text-green-400':'text-red-400'}">${p.pnl} $ (${p.pnl_pct}%)</p><p class="text-[9px] text-green-400">${trail}</p></div></div>`; }).join(''); } else { posDiv.innerHTML = '<p class="text-gray-500">لا صفقات - ينتظر 7/10 + تريلينق</p>'; }
+  if(d.positions && d.positions.length>0){ posDiv.innerHTML = d.positions.map(p=>`<div class="bg-[#0a0e14] border border-gray-800 rounded p-2 flex justify-between"><div><p class="font-bold">${p.symbol}</p></div><div class="text-left"><p class="font-bold ${p.pnl>=0?'text-green-400':'text-red-400'}">${p.pnl} $ (${p.pnl_pct}%)</p></div></div>`).join(''); } else { posDiv.innerHTML = '<p class="text-gray-500">ينتظر إشارة قوية</p>'; }
   const sigDiv = document.getElementById('signals');
-  if(d.signals && d.signals.length>0){ sigDiv.innerHTML = d.signals.map(s=>`<div class="flex justify-between bg-[#0a0e14] rounded p-2"><span>${s.symbol} ${s.direction} RSI:${s.rsi}</span><span class="bg-blue-900 px-2 rounded">${s.score}/10</span></div>`).join(''); } else { sigDiv.innerHTML = '<p class="text-gray-500">لا إشارات</p>'; }
-  const tradesRes = await fetch('/trades'); const tradesData = await tradesRes.json();
-  document.getElementById('trades').innerHTML = tradesData.slice(-15).reverse().map(t=>{ const c = t.type.includes('TRAIL') ? 'text-green-400' : t.type.includes('ENTRY')?'text-blue-400': t.pnl>0?'text-green-400':'text-red-400'; return `<p class="${c}">${new Date(t.time).toLocaleTimeString('ar-SA')} - ${t.type} ${t.symbol||''} ${t.pnl!=undefined?'PnL:'+t.pnl:''}</p>`; }).join('') || '<p class="text-gray-500">لا سجل</p>';
- }catch(e){console.log(e);}
+  if(d.signals && d.signals.length>0){ sigDiv.innerHTML = d.signals.map(s=>`<div class="flex justify-between bg-[#0a0e14] rounded p-2"><span>${s.symbol} ${s.direction}</span><span class="bg-blue-900 px-2 rounded">${s.score}/10</span></div>`).join(''); } else { sigDiv.innerHTML = '<p class="text-gray-500">لا إشارات</p>'; }
+ }catch(e){}
 }
 load(); setInterval(load, 8000);
 </script></body></html>
@@ -412,32 +354,24 @@ def api_status():
     total,cnt,pos,syms=get_positions()
     cfg=get_auto_config()
     eq=cfg["EQ"]
-    btc_trend, btc_vol, btc_info = get_btc_status()
+    btc_trend, btc_vol = get_btc_status()
     return jsonify({
         "futures_free":round(eq["futures_free"],4),
-        "spot_all":round(eq.get("spot_all",0),4),
-        "total_equity":round(cfg["TOTAL"],2),
-        "auto_mode":cfg["MODE"],
         "btc_trend":btc_trend,
         "btc_vol":round(btc_vol*100,3),
         "open_count":cnt,
         "max_positions":cfg["MAX"],
         "daily_pnl":state["daily_pnl"],
-        "scanned":state["scanned"],
-        "loop":state["loop"],
-        "last_scan":state["last_scan"],
         "signals":state["signals"],
-        "positions":[{"symbol":p["symbol"],"side":p.get("side"),"entry":p.get("entryPrice"),"pnl":round(float(p.get("unrealizedPnl") or 0),4),"pnl_pct":round(float(p.get("percentage") or 0),2),"sl_moved":state["open_trades"].get(p["symbol"],{}).get("sl_moved",0),"locked":state["open_trades"].get(p["symbol"],{}).get("locked",0)} for p in pos if float(p.get("contracts") or 0)>0],
+        "positions":[{"symbol":p["symbol"],"pnl":round(float(p.get("unrealizedPnl") or 0),4),"pnl_pct":round(float(p.get("percentage") or 0),2)} for p in pos if float(p.get("contracts") or 0)>0],
     })
 @app.route("/trades")
 def trades(): return jsonify(load_trades()[-100:])
 @app.route("/ping")
 def ping(): return jsonify({"pong":True})
-@app.route("/health")
-def health(): return jsonify({"status":"online","version":"V100003 TRAILING","trailing":True})
 
 if __name__=="__main__":
     threading.Thread(target=run_bot,daemon=True).start()
     threading.Thread(target=local_protection_loop,daemon=True).start()
-    log.info("V100003 TRAILING started")
+    log.info("FINAL TRAILING started")
     app.run(host="0.0.0.0",port=int(os.getenv("PORT","10000")),debug=False,use_reloader=False)
