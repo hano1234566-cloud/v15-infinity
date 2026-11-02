@@ -1,11 +1,11 @@
 import os, time, json, logging
 from datetime import datetime, timezone, date
 import ccxt, pandas as pd
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 
 CONFIG = {
-    "RISK_PER_TRADE": 0.01,  # 1% فقط - طلبك
-    "MAX_POSITIONS": 2,  # صفقتين فقط
+    "RISK_PER_TRADE": 0.01,
+    "MAX_POSITIONS": 2,
     "LEVERAGE": 3,
     "MAX_COINS": 18,
     "TIMEFRAME": "15m",
@@ -15,8 +15,8 @@ CONFIG = {
     "TAKE_PROFIT": 0.025,
     "STOP_LOSS": 0.011,
     "DAILY_LOSS_LIMIT": 4.0,
-    "MAX_CONSECUTIVE_LOSSES": 3,  # طلب 5
-    "BTC_VOLATILITY_LIMIT": 0.04,  # لا يفتح اذا BTC تقلبه >4%
+    "MAX_CONSECUTIVE_LOSSES": 3,
+    "BTC_VOLATILITY_LIMIT": 0.04,
     "STATE_FILE": "bot_state.json",
     "TRADES_FILE": "trades_log.json",
 }
@@ -30,7 +30,6 @@ log=logging.getLogger("V100SAFE")
 app=Flask(__name__)
 exchange=ccxt.okx({"apiKey":API_KEY,"secret":API_SECRET,"password":API_PASSWORD,"enableRateLimit":True,"options":{"defaultType":"swap"}})
 
-# تحميل حالة محفوظة - طلب 4
 def load_state():
     try:
         with open(CONFIG["STATE_FILE"],"r") as f: return json.load(f)
@@ -45,7 +44,7 @@ state={
     "consecutive_losses": saved.get("consecutive_losses",0),
     "stopped_by_loss": False,
     "stopped_reason": "",
-    "open_trades": saved.get("open_trades",{}),  # symbol -> entry info
+    "open_trades": saved.get("open_trades",{}),
 }
 
 def save_state():
@@ -65,7 +64,6 @@ def save_trade_log(entry):
         with open(CONFIG["TRADES_FILE"],"w") as f: json.dump(trades[-300:], f, indent=2)
     except: pass
 
-# طلب 3 مهم: مجموعات الارتباط
 CORRELATED_GROUPS = {
     "MAJORS": ["BTC/USDT:USDT","ETH/USDT:USDT","SOL/USDT:USDT","AVAX/USDT:USDT","ADA/USDT:USDT","DOT/USDT:USDT"],
     "L2": ["ARB/USDT:USDT","OP/USDT:USDT"],
@@ -78,7 +76,6 @@ def is_correlated(new_symbol, open_symbols):
             for s in open_symbols:
                 if s in members and s!=new_symbol:
                     return True, group
-    # لو فاتح BTC لا تفتح ETH/SOL معه
     if "BTC/USDT:USDT" in open_symbols and new_symbol in ["ETH/USDT:USDT","SOL/USDT:USDT"]:
         return True, "BTC-CORR"
     return False, ""
@@ -106,7 +103,7 @@ def fetch_df(symbol, tf):
         df=pd.DataFrame(candles,columns=["time","open","high","low","close","volume"])
         if len(df)<60: return None
         df=df.iloc[:-1].copy()
-        if df["close"].iloc[-1] < 0.01: return None
+        if df["close"].iloc[-1] < 0.005: return None
         df["ema9"]=df["close"].ewm(span=9).mean()
         df["ema21"]=df["close"].ewm(span=21).mean()
         df["ema50"]=df["close"].ewm(span=50).mean()
@@ -123,7 +120,6 @@ def fetch_df(symbol, tf):
 def get_btc_status():
     try:
         df=fetch_df("BTC/USDT", CONFIG["TIMEFRAME"])
-        df_h=fetch_df("BTC/USDT", CONFIG["TIMEFRAME_HTF"])
         if df is None: return "neutral",0
         curr=df.iloc[-1]
         atr_pct=curr["atr"]/curr["close"]
@@ -146,17 +142,14 @@ def analyze(symbol, btc_trend):
         if curr["ema9"]>curr["ema21"]>curr["ema50"] and curr["close"]>curr["ema200"]:
             if 50 < curr["rsi"] < 70 and curr["close"]>curr["bb_mid"]:
                 if curr_h["ema9"]<=curr_h["ema21"]: return None
-                score+=4
-                score+=3
-                if 52 < curr["rsi"] < 66: score+=2
+                score+=7
                 if prev["ema9"]<=prev["ema21"] and curr["ema9"]>curr["ema21"]: score+=3
                 if btc_trend=="bear" and score<7: return None
                 direction="long"
         if curr["ema9"]<curr["ema21"]<curr["ema50"] and curr["close"]<curr["ema200"]:
             if 30 < curr["rsi"] < 50 and curr["close"]<curr["bb_mid"]:
                 if curr_h["ema9"]>=curr_h["ema21"]: return None
-                score+=4; score+=3
-                if 34 < curr["rsi"] < 48: score+=2
+                score+=7
                 if prev["ema9"]>=prev["ema21"] and curr["ema9"]<curr["ema21"]: score+=3
                 if btc_trend=="bull" and score<7: return None
                 direction="short" if direction is None else direction
@@ -191,17 +184,11 @@ def get_targets(entry,direction):
 
 def verify_sl(swap):
     try:
-        # OKX algo check
         positions=exchange.fetch_positions([swap])
         for p in positions:
             if float(p.get("contracts") or 0)>0:
                 if p.get("stopLossPrice") or float(p.get("info",{}).get("stopLossPrice") or 0)>0:
                     return True
-        orders=exchange.fetch_open_orders(swap)
-        for o in orders:
-            info=str(o.get("info",""))
-            if "stopLoss" in info or o.get("stopLossPrice"):
-                return True
         return False
     except: return False
 
@@ -219,19 +206,12 @@ def place_trade(signal):
     total, cnt, _, open_syms = get_positions()
     if cnt >= CONFIG["MAX_POSITIONS"]: return
     if state["stopped_by_loss"]: return
-
     base=signal["symbol"].split("/")[0]; swap=base+"/USDT:USDT"
-
-    # طلب 2: منع المكرر
-    if any(base in s for s in open_syms):
-        return
-
-    # طلب 3 مهم: منع الارتباط
+    if any(base in s for s in open_syms): return
     corr, group = is_correlated(swap, open_syms)
     if corr:
-        log.info(f"SKIP CORRELATED {swap} with {open_syms} group {group}")
+        log.info(f"SKIP CORRELATED {swap} group {group}")
         return
-
     try:
         margin=calc_margin(signal["price"])
         amount=get_amount(swap,margin,signal["price"])
@@ -241,8 +221,6 @@ def place_trade(signal):
         side="buy" if signal["direction"]=="long" else "sell"; posSide="long" if signal["direction"]=="long" else "short"
         order=exchange.create_order(swap,"market",side,amount,None,{"tdMode":"isolated","posSide":posSide,"lever":str(CONFIG["LEVERAGE"])})
         avg=float(order.get("average") or signal["price"]); filled=float(order.get("filled") or amount)
-
-        # 🥇 أهم خطوة: إنشاء SL + التحقق
         t=get_targets(avg, signal["direction"])
         sl_ok=False
         for attempt in range(2):
@@ -256,34 +234,25 @@ def place_trade(signal):
             except Exception as e:
                 state["errors"].append(f"SL try {attempt}: {str(e)[-60:]}")
                 time.sleep(1)
-
         if not sl_ok:
-            # 🥇 فشل SL -> اغلاق فوري - هذا أهم من أي EMA
             emergency_close(swap, signal["direction"], filled, "SL_FAILED")
             save_trade_log({"time":datetime.now(timezone.utc).isoformat(),"type":"FAIL_SL_CLOSE","symbol":swap,"entry":avg,"reason":"SL not verified"})
             return
-
-        # نجح - سجل
         state["open_trades"][swap]={"entry":avg,"direction":signal["direction"],"margin":margin,"amount":filled,"time":datetime.now(timezone.utc).isoformat()}
         save_state()
-        save_trade_log({"time":datetime.now(timezone.utc).isoformat(),"type":"ENTRY","symbol":swap,"direction":signal["direction"],"entry":avg,"margin":margin,"amount":filled,"score":signal["score"],"sl_verified":True,"btc":state["btc_trend"]})
+        save_trade_log({"time":datetime.now(timezone.utc).isoformat(),"type":"ENTRY","symbol":swap,"direction":signal["direction"],"entry":avg,"margin":margin,"amount":filled,"score":signal["score"],"sl_verified":True})
         log.info(f"SAFE OPEN {swap} {signal['direction']} margin:{margin}$ SL OK")
-
     except Exception as e: state["errors"].append(str(e)[-150:])
 
 def check_closed_and_update_pnl():
-    # 🥈 حساب PnL بدقة من السجل الداخلي
     try:
         today=str(date.today())
         if state["daily_date"]!=today:
             state["daily_pnl"]=0.0; state["consecutive_losses"]=0; state["daily_date"]=today; state["stopped_by_loss"]=False; save_state()
-
-        _, _, pos_list, current_syms = get_positions()
-        # شف اي عملة كانت مفتوحة والان مقفلة
+        _, _, _, current_syms = get_positions()
         closed_syms = [s for s in list(state["open_trades"].keys()) if s not in current_syms]
         for sym in closed_syms:
             try:
-                # جيب آخر صفقات مقفلة
                 trades=exchange.fetch_my_trades(sym, limit=20)
                 pnl=0.0
                 for t in reversed(trades[-5:]):
@@ -291,58 +260,35 @@ def check_closed_and_update_pnl():
                     if info.get("realizedPnl") or info.get("pnl"):
                         pnl=float(info.get("realizedPnl") or info.get("pnl") or 0)
                         if pnl!=0: break
-                # لو ما لقينا، نحسب تقريبي
-                if pnl==0:
-                    # من آخر كاندل
-                    entry=state["open_trades"][sym]["entry"]
-                    # نفترض خروج على SL/TP للتبسيط - OKX يعطي pnl في trades
-                    pass
-
                 if pnl!=0:
                     state["daily_pnl"]=round(state["daily_pnl"]+pnl,4)
                     if pnl<0: state["consecutive_losses"]+=1
                     else: state["consecutive_losses"]=0
                     save_trade_log({"time":datetime.now(timezone.utc).isoformat(),"type":"EXIT","symbol":sym,"pnl":pnl,"daily_pnl":state["daily_pnl"],"consecutive":state["consecutive_losses"]})
-                    log.info(f"EXIT {sym} pnl:{pnl} daily:{state['daily_pnl']} consec:{state['consecutive_losses']}")
-
                 del state["open_trades"][sym]
                 save_state()
             except Exception as e:
-                state["errors"].append(f"pnl calc {sym}: {e}")
                 del state["open_trades"][sym]
-
-        # حدود الايقاف
         if state["daily_pnl"] <= -CONFIG["DAILY_LOSS_LIMIT"]:
             state["stopped_by_loss"]=True; state["stopped_reason"]=f"DAILY LOSS {state['daily_pnl']}$"
         if state["consecutive_losses"] >= CONFIG["MAX_CONSECUTIVE_LOSSES"]:
             state["stopped_by_loss"]=True; state["stopped_reason"]=f"{state['consecutive_losses']} LOSSES IN ROW"
-
     except Exception as e: state["errors"].append(f"check closed {e}")
 
 def scan_and_trade():
     try: exchange.load_markets()
     except: pass
-
     check_closed_and_update_pnl()
-
-    if state["stopped_by_loss"]:
-        return
-
+    if state["stopped_by_loss"]: return
     btc_trend, btc_vol = get_btc_status()
     state["btc_trend"]=btc_trend; state["btc_vol"]=round(btc_vol*100,2)
-
-    # لا تفتح اذا BTC مجنون
     if btc_vol > CONFIG["BTC_VOLATILITY_LIMIT"]:
         log.info(f"BTC VOLATILE {btc_vol*100:.2f}% SKIP")
-        state["signals"]=[{"symbol":"BTC","reason":f"VOLATILE {btc_vol*100:.2f}% NO TRADE"}]
         return
-
     _, cnt, _, open_syms = get_positions()
     if cnt>=CONFIG["MAX_POSITIONS"]: return
-
     signals=[]; scanned=0
     TOP_COINS = ["BTC/USDT","ETH/USDT","SOL/USDT","AVAX/USDT","LINK/USDT","ADA/USDT","LTC/USDT","DOT/USDT","ARB/USDT","ENA/USDT","FET/USDT","TAO/USDT","RENDER/USDT","SUI/USDT","SEI/USDT","APT/USDT","NEAR/USDT","OP/USDT"]
-
     for s in TOP_COINS:
         base=s.split("/")[0]; swap=base+"/USDT:USDT"
         if any(base in sym for sym in open_syms): continue
@@ -350,13 +296,12 @@ def scan_and_trade():
         scanned+=1
         if sig: signals.append(sig)
         time.sleep(0.2)
-
     signals.sort(key=lambda x:x["score"],reverse=True)
     state["scanned"]=scanned; state["signals"]=signals[:5]; state["last_scan"]=datetime.now(timezone.utc).isoformat(); state["loop"]+=1
     if signals: place_trade(signals[0])
 
 def run_bot():
-    log.info("V100000 FINAL SAFE STARTED")
+    log.info("V100000 FINAL SAFE + SPOT STARTED")
     while state["running"]:
         try: scan_and_trade()
         except Exception as e: state["errors"].append(str(e)[-100:]); state["errors"]=state["errors"][-5:]
@@ -366,7 +311,7 @@ def run_bot():
 def home():
     total,cnt,pos,syms=get_positions()
     return jsonify({
-        "bot":"V100000 FINAL SAFE - رأس المال أولا",
+        "bot":"V100000 FINAL SAFE + SPOT",
         "balance":round(get_free_usdt(),4),
         "btc_trend":state["btc_trend"],
         "btc_vol":f"{state['btc_vol']}%",
@@ -377,7 +322,6 @@ def home():
         "daily_pnl":state["daily_pnl"],
         "daily_limit":-CONFIG["DAILY_LOSS_LIMIT"],
         "consecutive_losses":state["consecutive_losses"],
-        "max_consecutive":CONFIG["MAX_CONSECUTIVE_LOSSES"],
         "stopped":state["stopped_by_loss"],
         "stopped_reason":state["stopped_reason"],
         "risk":f"{CONFIG['RISK_PER_TRADE']*100}%",
@@ -386,10 +330,14 @@ def home():
         "signals":state["signals"],
         "positions":[{"symbol":p["symbol"],"side":p.get("side"),"entry":p.get("entryPrice"),"pnl":round(float(p.get("unrealizedPnl") or 0),4)} for p in pos if float(p.get("contracts") or 0)>0],
         "errors":state["errors"][-3:],
+        "endpoints":["/ping","/trades","/spot","/reset_daily"]
     })
 
 @app.route("/ping")
 def ping(): return jsonify({"pong":True,"loop":state["loop"],"daily_pnl":state["daily_pnl"],"stopped":state["stopped_by_loss"],"btc_vol":state["btc_vol"]})
+
+@app.route("/health")
+def health(): return jsonify({"status":"online","loop":state["loop"]})
 
 @app.route("/trades")
 def trades(): return jsonify(load_trades()[-40:])
@@ -398,6 +346,84 @@ def trades(): return jsonify(load_trades()[-40:])
 def reset_daily():
     state["daily_pnl"]=0.0; state["consecutive_losses"]=0; state["stopped_by_loss"]=False; state["stopped_reason"]=""; state["daily_date"]=str(date.today()); save_state()
     return jsonify({"reset":True})
+
+@app.route("/spot")
+def spot_analysis():
+    try:
+        # نجيب رصيد السبوت عبر REST مباشرة
+        bal=exchange.fetch_balance()
+        spot_holdings=[]
+        for coin, data in bal.get("total",{}).items():
+            if coin=="USDT": continue
+            total_amt=float(data or 0)
+            if total_amt>0:
+                try:
+                    symbol=f"{coin}/USDT"
+                    ticker=exchange.fetch_ticker(symbol)
+                    price=float(ticker["last"])
+                    df=fetch_df(symbol, "1h")
+                    if df is None:
+                        trend="غير معروف"; advice="انتظر - ما قدر يقرأ الشارت"; rsi_val=None
+                    else:
+                        curr=df.iloc[-1]
+                        rsi_val=round(float(curr["rsi"]),1)
+                        if curr["close"]<curr["ema50"] and curr["rsi"]<40:
+                            trend="هابط قرب قاع"; advice="لا تبيع الآن - انتظر ارتداد"
+                        elif curr["close"]>curr["ema50"] and curr["rsi"]>70:
+                            trend="قمة محتملة"; advice="بيع 50% الآن"
+                        elif curr["close"]>curr["ema200"] and curr["rsi"]<65:
+                            trend="صاعد قوي"; advice="انتظر - لا تبيع"
+                        elif curr["close"]<curr["ema200"]:
+                            trend="هابط"; advice="انتظر أو بيع وادخل فيوتشر"
+                        else:
+                            trend="عرضي"; advice="انتظر"
+                    value=total_amt*price
+                    if value>=0.5:  # اكثر من 0.5$
+                        spot_holdings.append({
+                            "coin":coin,
+                            "amount":total_amt,
+                            "price":price,
+                            "value_usdt":round(value,2),
+                            "trend":trend,
+                            "advice":advice,
+                            "rsi":rsi_val
+                        })
+                except Exception as e:
+                    spot_holdings.append({"coin":coin,"amount":total_amt,"price":0,"value_usdt":0,"trend":"خطأ","advice":str(e)[:50]})
+        spot_holdings.sort(key=lambda x:x["value_usdt"], reverse=True)
+        total_value=sum([h["value_usdt"] for h in spot_holdings])
+        return jsonify({
+            "total_spot_value":round(total_value,2),
+            "count":len(spot_holdings),
+            "holdings":spot_holdings,
+            "summary": f"عندك {len(spot_holdings)} عملة قديمة قيمتها {total_value:.2f}$ - ادخل /spot/sell?coin=XXX&pct=50 للبيع"
+        })
+    except Exception as e:
+        return jsonify({"error":str(e)})
+
+@app.route("/spot/sell")
+def spot_sell():
+    try:
+        coin=request.args.get("coin","").upper()
+        pct=float(request.args.get("pct","50"))
+        if not coin: return jsonify({"error":"اكتب ?coin=BTC&pct=50"})
+        bal=exchange.fetch_balance()
+        amount=float(bal.get("total",{}).get(coin,0) or bal.get("free",{}).get(coin,0) or 0)
+        if amount==0: return jsonify({"error":f"ما عندك {coin} في السبوت"})
+        sell_amount=amount*pct/100
+        symbol=f"{coin}/USDT"
+        # بيع سبوت - نستخدم spot type
+        exchange.options["defaultType"]="spot"
+        try:
+            order=exchange.create_market_sell_order(symbol, sell_amount)
+        except:
+            order=exchange.create_order(symbol, "market", "sell", sell_amount)
+        exchange.options["defaultType"]="swap"
+        save_trade_log({"time":datetime.now(timezone.utc).isoformat(),"type":"SPOT_SELL","symbol":symbol,"amount":sell_amount,"pct":pct})
+        return jsonify({"sold":f"{sell_amount} {coin}", "order_id":order.get("id"), "symbol":symbol})
+    except Exception as e:
+        exchange.options["defaultType"]="swap"
+        return jsonify({"error":str(e)})
 
 if __name__=="__main__":
     import threading; threading.Thread(target=run_bot,daemon=True).start()
