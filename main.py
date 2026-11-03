@@ -8,16 +8,16 @@ SECRET = (os.getenv("OKX_SECRET_KEY","") or os.getenv("OKX_SECRET","")).strip()
 PASSPHRASE = os.getenv("OKX_PASSPHRASE","").strip()
 
 BAL = 0.0
-LAST = "V30012 - رابط مباشر OKX"
+LAST = "V30013 - حجم صحيح"
 SCAN_LOG = "🚀 يبدأ"
 SCAN_CURRENT = "BTC 1/60"
 ALL_RSI = []
 SCAN_IDX = 0
 FEE = 0.04
-BASE_MARGIN = 2.0
-COMP_MARGIN = 3.0
+BASE_MARGIN = 5.0  # رفعنا من 2$ لـ 5$ عشان BTC يقبل
+COMP_MARGIN = 8.0
 LEV = 10
-FILE = "/tmp/state_v30012.json"
+FILE = "/tmp/state_v30013.json"
 
 COINS_60 = ["BTC","ETH","SOL","XRP","BNB","DOGE","ADA","AVAX","DOT","LINK","TRX","LTC","BCH","UNI","PEPE","NEAR","ETC","APT","FIL","STX","MATIC","OP","ARB","HBAR","IMX","MNT","RNDR","TAO","INJ","AR","FET","GRT","LDO","MKR","AAVE","SUI","SEI","WIF","BONK","JUP","ENA","WLD","FLOKI","TIA","PYTH","STRK","JTO","ORDI","SATS","RUNE","FLOW","KAS","BEAM","ARKM","AGIX","XLM","XMR","CRO","VET","ALGO"]
 
@@ -75,7 +75,6 @@ def calc_rsi_safe(prices):
     except: return 50
 
 def fetch_direct(name):
-    # رابط OKX المباشر - ما ينحظر في Render
     try:
         inst=f"{name}-USDT-SWAP"
         url=f"https://www.okx.com/api/v5/market/candles?instId={inst}&bar=1H&limit=100"
@@ -83,17 +82,9 @@ def fetch_direct(name):
         data=r.json()
         if data.get("code")=="0" and data.get("data"):
             closes=[float(x[4]) for x in data["data"] if len(x)>=5]
-            closes=closes[::-1]  # OKX يرجع من الجديد للقديم
+            closes=closes[::-1]
             if len(closes)>=20:
                 return closes, f"{name}/USDT:USDT"
-    except: pass
-    # fallback ccxt
-    try:
-        ex=get_ex_auth()
-        ohlcv=ex.fetch_ohlcv(f"{name}/USDT:USDT",'1h',100)
-        closes=[float(c[4]) for c in ohlcv if c and len(c)>=5]
-        if len(closes)>=20:
-            return closes, f"{name}/USDT:USDT"
     except: pass
     return None, None
 
@@ -185,21 +176,66 @@ def hunter():
             open_names=[v["name"] for v in STATE["open"].values()]
             if live<2 and get_bal()>=STATE["next_margin"]:
                 res=scan_chunk()
-                to_open=next((s for s in (res["strong"]+res["medium"]) if s["symbol"] not in open_names and s["symbol"] not in STATE["blacklist"]),None)
-                if to_open:
+                # رتب: ابدأ بالرخيص عشان يفتح بسرعة، الغالي يحتاج مارجن أكبر
+                candidates=sorted(res["strong"]+res["medium"], key=lambda x: (abs(x["rsi"]-50)*-1, x["price"]))
+                # لو فيه BTC و SOL - يفضل العملات الرخيصة أولاً عشان ما يفشل
+                cheap_first=sorted(candidates, key=lambda x: x["price"])
+                # جرب كل المرشحين لين واحد ينجح
+                for to_open in (candidates if len(candidates)<3 else cheap_first):
+                    if to_open["symbol"] in open_names or to_open["symbol"] in STATE["blacklist"]: continue
                     try:
-                        ex=get_ex_auth(); ex.set_leverage(LEV,to_open["full"])
-                        side="buy" if to_open["direction"]=="long" else "sell"; margin=STATE["next_margin"]
-                        if get_bal()<4 and margin==COMP_MARGIN: margin=BASE_MARGIN
-                        amt=(margin*LEV)/to_open["price"]; amt=float(ex.amount_to_precision(to_open["full"],max(amt,1)))
-                        order=ex.create_market_order(to_open["full"],side,amt,None,{'tdMode':'isolated'})
+                        ex=get_ex_auth()
+                        # احسب الكمية الصحيحة مع الحد الأدنى
+                        price=to_open["price"]
+                        margin=STATE["next_margin"]
+                        # BTC ETH يحتاجون مارجن أكبر
+                        if price>10000: margin=max(margin, 10)
+                        elif price>1000: margin=max(margin, 8)
+                        elif price>100: margin=max(margin, 5)
+                        
+                        if get_bal() < margin:
+                            LAST=f"⚠️ رصيد قليل ${get_bal():.2f} يحتاج ${margin}"
+                            continue
+                            
+                        ex.set_leverage(LEV,to_open["full"])
+                        side="buy" if to_open["direction"]=="long" else "sell"
+                        # احسب الكمية
+                        notional=margin*LEV
+                        amt=notional/price
+                        # تأكد من الحد الأدنى
+                        try:
+                            market=ex.market(to_open["full"])
+                            min_amt=float(market.get('limits',{}).get('amount',{}).get('min',0) or 0)
+                            if min_amt>0 and amt<min_amt:
+                                amt=min_amt
+                                margin=(amt*price)/LEV
+                                if margin>get_bal():
+                                    continue
+                        except: pass
+                        
+                        amt_str=ex.amount_to_precision(to_open["full"],amt)
+                        amt=float(amt_str)
+                        
+                        LAST=f"🔄 يحاول فتح {to_open['symbol']} كمية {amt} مارجن ${margin:.1f}"
+                        
+                        order=None
+                        for mode in [{'tdMode':'isolated'},{'tdMode':'cross'}]:
+                            try:
+                                order=ex.create_market_order(to_open["full"],side,amt,None,mode)
+                                break
+                            except Exception as e:
+                                LAST=f"❌ {to_open['symbol']} {str(e)[:60]}"
+                                continue
                         if order:
-                            entry=order.get("average") or to_open["price"]
+                            entry=float(order.get("average") or price)
                             STATE["open"][to_open["full"]]={"name":to_open["symbol"],"dir":to_open["direction"],"entry":entry,"best":0,"best_net":0,"type":to_open["type"],"score":to_open["score"],"rsi":to_open["rsi"]}
-                            LAST=f"✅ فتح {to_open['type']} {to_open['symbol']} RSI {to_open['rsi']}"; save()
-                    except Exception as e: LAST=f"❌ {str(e)[:40]}"
+                            LAST=f"✅ فتح {to_open['type']} {to_open['symbol']} {to_open['direction']} RSI {to_open['rsi']} كمية {amt}"; save()
+                            break  # فتح واحد وكفى
+                    except Exception as e:
+                        LAST=f"❌ {to_open['symbol']} {str(e)[:80]}"
+                        continue
             time.sleep(4)
-        except Exception as e: LAST=f"خطأ {str(e)[:50]}"; time.sleep(5)
+        except Exception as e: LAST=f"خطأ {str(e)[:80]}"; time.sleep(5)
 
 @app.route("/", methods=["GET","POST"])
 def index(): return HTML
@@ -221,7 +257,7 @@ def pnl():
     except: pass
     return jsonify({"bal":get_bal(),"total":STATE["total"],"live":live,"closed":STATE["closed"]})
 
-HTML = """<!DOCTYPE html><html lang=ar dir=rtl><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>V30012 مباشر</title><script src="https://cdn.tailwindcss.com"></script><style>body{background:#000;color:#fff}.card{background:#111214;border-radius:18px}.glass{background:#111c2f;border:1px solid #1e355a}.live-dot{animation:pulse 1s infinite}@keyframes pulse{0%,100%{opacity:1}50%{opacity:.5}}</style></head><body class="max-w-[480px] mx-auto p-3"><div class="bg-[#111214] rounded-[22px] p-4 border border-green-500/30"><div class="flex justify-between text-[11px] text-gray-400"><span class="flex gap-1 items-center"><span class="w-2 h-2 bg-green-500 rounded-full live-dot"></span>V30012 مباشر OKX</span><span>60</span></div><div class="flex gap-2 items-baseline mt-2"><div id="bal" class="text-[30px] font-black">$0</div><div id="total" class="text-[11px] text-gray-500"></div><div id="next" class="text-[10px] bg-yellow-500 text-black px-2 py-0.5 rounded-full font-bold"></div></div><div id="last" class="text-[12px] font-bold mt-2 text-yellow-300"></div><div class="mt-2 bg-black/60 rounded-xl p-2 border border-green-500/30"><div class="flex justify-between text-[10px]"><span class="text-green-400 font-bold">🔍 فحص LIVE</span><span id="scanCurrent" class="text-yellow-300 font-mono">-</span></div><div id="scanLog" class="text-[11px] text-white mt-1 font-mono">بانتظار...</div><div class="mt-2 h-1.5 bg-white/10 rounded-full overflow-hidden"><div id="scanProgress" class="h-full bg-green-500" style="width:0%"></div></div></div><div class="flex gap-2 mt-3 flex-wrap"><span id="cnt" class="bg-white/10 px-3 py-1 rounded-full text-[10px]"></span><span id="allCount" class="bg-blue-500/20 px-3 py-1 rounded-full text-[10px]"></span></div></div><div id="liveBig" class="my-3"></div><div class="glass rounded-2xl p-3"><div class="flex justify-between text-[11px] font-black"><span>📊 كل العملات RSI</span><span id="idx" class="bg-white/10 px-2 py-0.5 rounded-full text-[9px]">0</span></div><div id="all" class="space-y-2 mt-2 max-h-[600px] overflow-y-auto"></div></div><script>async function load(){const s=await fetch('/api/status').then(r=>r.json());document.getElementById('bal').textContent=`$${s.bal.toFixed(2)}`;document.getElementById('total').textContent=`/ $${s.total.toFixed(2)} كلي`;document.getElementById('next').textContent=s.next_margin>2?`الجاية $${s.next_margin} تعويض`:`الجاية $${s.next_margin}`;document.getElementById('last').textContent=s.last;document.getElementById('scanLog').textContent=s.scan_log;document.getElementById('scanCurrent').textContent=s.scan_current;document.getElementById('cnt').textContent=s.count+'/2 مفتوح';document.getElementById('allCount').textContent=(s.all_rsi||[]).length+'/60';document.getElementById('idx').textContent=s.scan_idx+'/60';const prog=s.scan_count>0?(parseInt(s.scan_current.split('/')[0].replace(/[^0-9]/g,''))||0)/s.scan_count*100:0;document.getElementById('scanProgress').style.width=prog+'%';document.getElementById('all').innerHTML=(s.all_rsi||[]).sort((a,b)=>Math.abs(b.rsi-50)-Math.abs(a.rsi-50)).map(x=>{const col=x.rsi<30?'border-green-500/60':x.rsi>70?'border-red-500/60':x.rsi<45||x.rsi>55?'border-yellow-500/40':'border-white/10';const dir=x.rsi<50?'LONG':'SHORT';return `<div class="bg-black/40 rounded-xl p-2.5 flex justify-between items-center border ${col}"><div><div class="text-[12px] font-bold">${x.symbol} <span class="px-1.5 py-0.5 rounded-full text-[9px] ${dir=='LONG'?'bg-green-500 text-black':'bg-red-500'}">${dir}</span></div><div class="text-[10px] text-gray-500">RSI ${x.rsi}</div></div><div class="text-[11px] font-bold">$${x.price.toFixed(4)}</div></div>`}).join('')||`<div class="text-[10px] text-gray-500 text-center py-4">يفحص... ${s.scan_current}<br>${s.scan_log}</div>`;const d=await fetch('/api/pnl').then(r=>r.json());document.getElementById('liveBig').innerHTML=d.live.length?d.live.map(x=>`<div class="card p-4 border-2 ${x.gross<0?'border-red-500/60':'border-green-500/50'}"><div class="flex justify-between text-[11px]"><span>${x.type} ${x.sym}</span><span>${x.side.toUpperCase()} ${x.lev}x</span></div><div class="text-[26px] font-black ${x.gross<0?'text-red-500':'text-green-400'}">${x.gross>=0?'+':''}${x.gross.toFixed(2)}</div></div>`).join(''):`<div class="glass rounded-[20px] p-6 text-center text-[11px] text-gray-400">يستخدم رابط OKX المباشر<br>يفحص 5 عملات كل 4 ثواني</div>`;}setInterval(load,1000);load();</script></body></html>
+HTML = """<!DOCTYPE html><html lang=ar dir=rtl><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>V30013 حجم صحيح</title><script src="https://cdn.tailwindcss.com"></script><style>body{background:#000;color:#fff}.card{background:#111214;border-radius:18px}.glass{background:#111c2f;border:1px solid #1e355a}.live-dot{animation:pulse 1s infinite}@keyframes pulse{0%,100%{opacity:1}50%{opacity:.5}}</style></head><body class="max-w-[480px] mx-auto p-3"><div class="bg-[#111214] rounded-[22px] p-4 border border-green-500/30"><div class="flex justify-between text-[11px] text-gray-400"><span class="flex gap-1 items-center"><span class="w-2 h-2 bg-green-500 rounded-full live-dot"></span>V30013 حجم صحيح</span><span>60</span></div><div class="flex gap-2 items-baseline mt-2"><div id="bal" class="text-[30px] font-black">$0</div><div id="total" class="text-[11px] text-gray-500"></div><div id="next" class="text-[10px] bg-yellow-500 text-black px-2 py-0.5 rounded-full font-bold"></div></div><div id="last" class="text-[12px] font-bold mt-2 text-yellow-300 break-all"></div><div class="mt-2 bg-black/60 rounded-xl p-2 border border-green-500/30"><div class="flex justify-between text-[10px]"><span class="text-green-400 font-bold">🔍 فحص LIVE</span><span id="scanCurrent" class="text-yellow-300 font-mono">-</span></div><div id="scanLog" class="text-[11px] text-white mt-1 font-mono">بانتظار...</div><div class="mt-2 h-1.5 bg-white/10 rounded-full overflow-hidden"><div id="scanProgress" class="h-full bg-green-500" style="width:0%"></div></div></div><div class="flex gap-2 mt-3 flex-wrap"><span id="cnt" class="bg-white/10 px-3 py-1 rounded-full text-[10px]"></span><span id="allCount" class="bg-blue-500/20 px-3 py-1 rounded-full text-[10px]"></span></div></div><div id="liveBig" class="my-3"></div><div class="glass rounded-2xl p-3"><div class="flex justify-between text-[11px] font-black"><span>📊 كل العملات RSI</span><span id="idx" class="bg-white/10 px-2 py-0.5 rounded-full text-[9px]">0</span></div><div id="all" class="space-y-2 mt-2 max-h-[600px] overflow-y-auto"></div></div><script>async function load(){const s=await fetch('/api/status').then(r=>r.json());document.getElementById('bal').textContent=`$${s.bal.toFixed(2)}`;document.getElementById('total').textContent=`/ $${s.total.toFixed(2)} كلي`;document.getElementById('next').textContent=s.next_margin>2?`الجاية $${s.next_margin} تعويض`:`الجاية $${s.next_margin}`;document.getElementById('last').textContent=s.last;document.getElementById('scanLog').textContent=s.scan_log;document.getElementById('scanCurrent').textContent=s.scan_current;document.getElementById('cnt').textContent=s.count+'/2 مفتوح';document.getElementById('allCount').textContent=(s.all_rsi||[]).length+'/60';document.getElementById('idx').textContent=s.scan_idx+'/60';const prog=s.scan_count>0?(parseInt(s.scan_current.split('/')[0].replace(/[^0-9]/g,''))||0)/s.scan_count*100:0;document.getElementById('scanProgress').style.width=prog+'%';document.getElementById('all').innerHTML=(s.all_rsi||[]).sort((a,b)=>Math.abs(b.rsi-50)-Math.abs(a.rsi-50)).map(x=>{const col=x.rsi<30?'border-green-500/60':x.rsi>70?'border-red-500/60':x.rsi<45||x.rsi>55?'border-yellow-500/40':'border-white/10';const dir=x.rsi<50?'LONG':'SHORT';return `<div class="bg-black/40 rounded-xl p-2.5 flex justify-between items-center border ${col}"><div><div class="text-[12px] font-bold">${x.symbol} <span class="px-1.5 py-0.5 rounded-full text-[9px] ${dir=='LONG'?'bg-green-500 text-black':'bg-red-500'}">${dir}</span></div><div class="text-[10px] text-gray-500">RSI ${x.rsi}</div></div><div class="text-[11px] font-bold">$${x.price.toFixed(4)}</div></div>`}).join('')||`<div class="text-[10px] text-gray-500 text-center py-4">يفحص... ${s.scan_current}<br>${s.scan_log}</div>`;const d=await fetch('/api/pnl').then(r=>r.json());document.getElementById('liveBig').innerHTML=d.live.length?d.live.map(x=>`<div class="card p-4 border-2 ${x.gross<0?'border-red-500/60':'border-green-500/50'}"><div class="flex justify-between text-[11px]"><span>${x.type} ${x.sym}</span><span>${x.side.toUpperCase()} ${x.lev}x RSI ${x.rsi}</span></div><div class="text-[26px] font-black ${x.gross<0?'text-red-500':'text-green-400'}">${x.gross>=0?'+':''}${x.gross.toFixed(2)}</div></div>`).join(''):`<div class="glass rounded-[20px] p-6 text-center text-[11px] text-gray-400">يفتح الرخيص أولاً SOL XRP<br>حتى لو BTC غالي</div>`;}setInterval(load,1000);load();</script></body></html>
 """
 
 threading.Thread(target=hunter,daemon=True).start()
