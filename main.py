@@ -1,4 +1,5 @@
 import ccxt, os, json, time, threading
+from datetime import datetime
 from flask import Flask
 
 STATE_FILE="state.json"
@@ -14,15 +15,7 @@ SPOT_RESERVE = ["AAVE/USDT:USDT","DOGE/USDT:USDT"]
 app = Flask(__name__)
 state_global={}
 open_global=[]
-log_global="starting"
-
-def get_key(n):
-    v=os.getenv(n)
-    if v: return v.strip()
-    for p in [f"/etc/secrets/{n}", f"./{n}"]:
-        if os.path.exists(p):
-            with open(p) as f: return f.read().strip()
-    return None
+log_global="V30030 starting"
 
 def load_state():
     if os.path.exists(STATE_FILE):
@@ -33,93 +26,90 @@ def load_state():
 def save_state(s):
     with open(STATE_FILE,'w') as f: json.dump(s,f)
 
-def make_exchange():
-    k=get_key('OKX_API_KEY') or get_key('OKX_AP') or get_key('FUTURE_API_KEY')
-    s=get_key('OKX_SECRET') or get_key('OKX_SE') or get_key('FUTURE_SECRET')
-    p=get_key('OKX_PASSPHRASE') or get_key('OKX_PA') or get_key('FUTURE_PASSPHRASE')
-    return ccxt.okx({'apiKey':k,'secret':s,'password':p,'enableRateLimit':True,'timeout':30000,'options':{'defaultType':'swap'}})
+# === نفس اتصال V30026 اللي كان متصل تمام ===
+exchange = ccxt.okx({
+    'apiKey': os.getenv('OKX_API_KEY'),
+    'secret': os.getenv('OKX_SECRET'),
+    'password': os.getenv('OKX_PASSPHRASE'),
+    'enableRateLimit': True,
+    'options': {'defaultType': 'swap'}
+})
 
 def net_profit(g):
     try: return float(g)-FEE
     except: return -10
 def get_stop(net,curr):
     t=LOSS_FIXED
-    for pr,sl in LEVELS:
-        if net>=pr: t=sl
+    for p,sl in LEVELS:
+        if net>=p: t=sl
     return max(t,curr)
 
 def run_bot():
     global state_global, open_global, log_global
     state=load_state()
-    retry=0
     while True:
         try:
-            ex=make_exchange()
-            # اختبار اتصال
-            bal=ex.fetch_balance()
-            log_global=f"CONNECTED OK retry={retry}"
-            retry=0
-            
-            while True:
+            positions = exchange.fetch_positions()
+            open_syms=[]
+            for pos in positions:
+                if float(pos.get('contracts',0) or 0) > 0:
+                    sym=pos['symbol']
+                    open_syms.append(sym)
+                    gross=pos.get('unrealizedPnl',0)
+                    net=net_profit(gross)
+                    curr=state.get(sym,{}).get('sl',LOSS_FIXED)
+                    new=get_stop(net,curr)
+                    if new>curr or sym not in state:
+                        state[sym]={'sl':new,'net':net}
+                        save_state(state)
+
+            open_global=open_syms
+            state_global=state
+            log_global=f"OK {len(open_syms)}/5 - CONTINUOUS MODE"
+
+            # تقفيل
+            for sym in list(open_syms):
                 try:
-                    positions=ex.fetch_positions()
-                    open_syms=[]
-                    for pos in positions:
-                        if float(pos.get('contracts',0) or 0) > 0:
-                            sym=pos['symbol']
-                            open_syms.append(sym)
-                            gross=pos.get('unrealizedPnl',0)
-                            net=net_profit(gross)
-                            curr=state.get(sym,{}).get('sl',LOSS_FIXED)
-                            new=get_stop(net,curr)
-                            if new>curr or sym not in state:
-                                state[sym]={'sl':new,'net':net}
-                                save_state(state)
-                            # تشييك تقفيل
-                            if net<=curr:
-                                try:
-                                    amt=float(pos['contracts'])
-                                    ex.create_market_order(sym,'sell',amt)
-                                    log_global=f"CLOSED {sym} net={net:.2f}"
+                    net=state.get(sym,{}).get('net',0)
+                    sl=state.get(sym,{}).get('sl',LOSS_FIXED)
+                    if net<=sl:
+                        for pos in positions:
+                            if pos['symbol']==sym and float(pos.get('contracts',0) or 0)>0:
+                                amt=float(pos['contracts'])
+                                exchange.create_market_order(sym,'sell',amt)
+                                log_global=f"CLOSED {sym} net={net:.2f}"
+                                if sym in state:
                                     del state[sym]
                                     save_state(state)
-                                except Exception as e:
-                                    log_global=f"CLOSE FAIL {sym} {e}"
-
-                    open_global=open_syms
-                    state_global=state
-                    
-                    need=MAX_OPEN-len(open_syms)
-                    if need>0:
-                        for sym in COINS_60:
-                            if sym not in open_syms and sym not in SPOT_RESERVE and need>0:
-                                try:
-                                    t=ex.fetch_ticker(sym)
-                                    amt=float(ex.amount_to_precision(sym, USD_PER_TRADE/t['last']))
-                                    ex.set_leverage(LEVERAGE, sym)
-                                    ex.create_market_order(sym,'buy',amt)
-                                    need-=1
-                                    time.sleep(1.5)
-                                except: time.sleep(0.5)
-                    time.sleep(4)
-                except (ccxt.NetworkError, ccxt.ExchangeNotAvailable, ccxt.RequestTimeout) as e:
-                    log_global=f"NET ERR {e} - reconnect in 5s"
-                    time.sleep(5)
-                    break # يطلع ويعيد make_exchange
                 except Exception as e:
-                    log_global=f"LOOP ERR {e}"
-                    time.sleep(3)
+                    log_global=f"CLOSE ERR {e}"
 
+            # === الاستمرارية: أول ما تقفل يفتح غيرها ===
+            need = MAX_OPEN - len(open_syms)
+            if need > 0:
+                for sym in COINS_60:
+                    if sym not in open_syms and sym not in SPOT_RESERVE and need>0:
+                        try:
+                            t=exchange.fetch_ticker(sym)
+                            amt=float(exchange.amount_to_precision(sym, USD_PER_TRADE/t['last']))
+                            exchange.set_leverage(LEVERAGE, sym)
+                            exchange.create_market_order(sym,'buy',amt)
+                            log_global=f"OPENED {sym}"
+                            need-=1
+                            time.sleep(1.2)
+                        except Exception as e:
+                            log_global=f"FAIL {sym} {e}"
+                            time.sleep(0.5)
+            time.sleep(5)
         except Exception as e:
-            retry+=1
-            log_global=f"CONN FAIL {e} retry {retry}/10"
-            time.sleep(min(5*retry, 60))
+            log_global=f"ERR {e} - reconnect in 3s"
+            time.sleep(3)
 
 @app.route("/")
 def index():
-    opens="<br>".join(open_global) or "جاري..."
+    opens="<br>".join(open_global) or "جاري الفتح..."
     states="<br>".join([f"{k}: SL={v['sl']} net={v.get('net',0):.2f}" for k,v in state_global.items()])
-    return f"V30029 FIXED CONNECTION<br><br>OPEN {len(open_global)}/5:<br>{opens}<br><br>STATE:<br>{states}<br><br>LOG: {log_global}"
+    return f"V30030 (V30026 CONNECTION + CONTINUOUS)<br><br>OPEN {len(open_global)}/{MAX_OPEN}:<br>{opens}<br><br>STATE:<br>{states}<br><br>LOG: {log_global}"
 
 threading.Thread(target=run_bot, daemon=True).start()
 if __name__=="__main__":
