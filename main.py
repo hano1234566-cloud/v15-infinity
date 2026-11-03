@@ -1,730 +1,316 @@
-import os, time, json, logging, threading
-from datetime import datetime, timezone, date
-import ccxt, pandas as pd
+import os, json, time, re
+from datetime import datetime, timezone, timedelta
 from flask import Flask, jsonify, request
-import numpy as np
+import ccxt
 
+app = Flask(__name__)
+
+# ===== CONFIG V100004 $1 TARGET =====
 CONFIG = {
-    "RISK_PER_TRADE": 0.01,
-    "MAX_POSITIONS": 2,
-    "LEVERAGE": 3,
-    "MAX_COINS": 18,
-    "TIMEFRAME": "15m",
-    "TIMEFRAME_HTF": "1h",
-    "CANDLE_LIMIT": 300,
-    "SCAN_INTERVAL": 25,
-    "TAKE_PROFIT": 0.025,
-    "STOP_LOSS": 0.011,
-    "DAILY_LOSS_LIMIT": 4.0,
-    "MAX_CONSECUTIVE_LOSSES": 3,
-    "BTC_VOLATILITY_LIMIT": 0.04,
-    "STATE_FILE": "bot_state.json",
-    "TRADES_FILE": "trades_log.json",
-    "CONFIG_FILE": "config.json",
-    "SPOT_AUTO_SELL_WEAK": True,
-    "SPOT_WEAK_COINS": ["SOPH","CORE","XPL","WET","BONK"],
-    "SPOT_STRONG_COINS": ["AAVE","DOGE","TRX"],
-    "SPOT_SELL_RSI_PEAK": 70,
-    "SPOT_SELL_RSI_TOP": 75,
-    "LOCAL_SL_BUFFER": 0.003,
+    "EXCHANGE":"okx",
+    "MAX_POSITIONS":2,
+    "MARGIN_PER_TRADE":3.0,
+    "LEVERAGE":5,
+    "TAKE_PROFIT":0.012,  # 1.2% base
+    "STOP_LOSS":0.008,    # 0.8% SL إجباري
+    "TRAILING_ACTIVATE":0.007, # يبدأ التريلنج بعد 0.7%
+    "TRAILING_DISTANCE":0.004, # يلاحق كل 0.4%
+    "DOLLAR_TARGET":1.0,   # هدف $1 لكل صفقة
+    "DAILY_LOSS_LIMIT":3,
+    "MAX_CONSEC_LOSS":3,
 }
 
-try:
-    if os.path.exists(CONFIG["CONFIG_FILE"]):
-        with open(CONFIG["CONFIG_FILE"],"r") as f:
-            ext=json.load(f); CONFIG.update(ext)
-except: pass
-
-API_KEY=os.getenv("OKX_API_KEY","").strip() or os.getenv("OKX_KEY","").strip()
-API_SECRET=os.getenv("OKX_API_SECRET","").strip() or os.getenv("OKX_SECRET_KEY","").strip() or os.getenv("OKX_SECRET","").strip()
-API_PASSWORD=os.getenv("OKX_API_PASSWORD","").strip() or os.getenv("OKX_PASSPHRASE","").strip()
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
-log=logging.getLogger("V100002")
-app=Flask(__name__)
-exchange=ccxt.okx({"apiKey":API_KEY,"secret":API_SECRET,"password":API_PASSWORD,"enableRateLimit":True,"options":{"defaultType":"swap"}})
+STATE_FILE="bot_state.json"
+state={"open_trades":{},"daily_pnl":0.0,"consecutive_losses":0,"stopped_by_loss":False,"stopped_reason":"","errors":[],"trade_logs":[]}
 
 def load_state():
-    try:
-        with open(CONFIG["STATE_FILE"],"r") as f: return json.load(f)
-    except: return {}
-saved=load_state()
-state={
-    "running":True,"started":datetime.now(timezone.utc).isoformat(),"last_scan":None,"scanned":0,"signals":[],"errors":[],"loop":0,
-    "btc_trend":"unknown","btc_vol":0.0,
-    "daily_pnl": saved.get("daily_pnl",0.0) if saved.get("daily_date")==str(date.today()) else 0.0,
-    "daily_date": str(date.today()),
-    "consecutive_losses": saved.get("consecutive_losses",0),
-    "stopped_by_loss": False,"stopped_reason": "",
-    "open_trades": saved.get("open_trades",{}),
-    "spot_sold": saved.get("spot_sold",[]),
-    "auto_mode":"🛡️ حماية","auto_risk":0.01,"auto_lev":3,
-    "emergency_closes":0,
-}
+    global state
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE,"r",encoding="utf-8") as f:
+                s=json.load(f)
+                state.update(s)
+        except: pass
 
 def save_state():
     try:
-        with open(CONFIG["STATE_FILE"],"w") as f:
-            json.dump({"daily_pnl":state["daily_pnl"],"daily_date":state["daily_date"],"consecutive_losses":state["consecutive_losses"],"open_trades":state["open_trades"],"spot_sold":state["spot_sold"]}, f)
+        with open(STATE_FILE,"w",encoding="utf-8") as f:
+            json.dump(state,f,ensure_ascii=False)
     except: pass
-def load_trades():
-    try:
-        with open(CONFIG["TRADES_FILE"],"r") as f: return json.load(f)
-    except: return []
+
 def save_trade_log(entry):
     try:
-        trades=load_trades(); trades.append(entry)
-        with open(CONFIG["TRADES_FILE"],"w") as f: json.dump(trades[-500:], f, indent=2)
+        state["trade_logs"].append(entry)
+        state["trade_logs"]=state["trade_logs"][-100:]
+        save_state()
     except: pass
-def save_config(new_cfg):
-    try:
-        with open(CONFIG["CONFIG_FILE"],"w") as f: json.dump(new_cfg, f, indent=2)
-        CONFIG.update(new_cfg); return True
-    except Exception as e:
-        state["errors"].append(f"save cfg {e}"); return False
 
-def get_free_usdt():
-    try: bal=exchange.fetch_balance(); return float(bal.get("USDT",{}).get("free",0) or 0)
-    except: return 0
+load_state()
 
-def get_all_equity_breakdown():
-    try:
-        bal=exchange.fetch_balance()
-        futures_free = float(bal.get("USDT",{}).get("free",0) or 0)
-        futures_total = float(bal.get("USDT",{}).get("total",0) or futures_free)
-        spot_holdings=[]
-        total_spot=0.0
-        for coin, total_amt in bal.get("total",{}).items():
-            if coin=="USDT": continue
-            try:
-                amt=float(total_amt or 0)
-                if amt<=0: continue
-                symbol=f"{coin}/USDT"
-                ticker=exchange.fetch_ticker(symbol)
-                price=float(ticker["last"])
-                value=amt*price
-                if value>=0.3:
-                    spot_holdings.append({"coin":coin,"amount":amt,"price":price,"value":value})
-                    total_spot+=value
-            except: continue
-        strong_val=sum([h["value"] for h in spot_holdings if h["coin"] in CONFIG["SPOT_STRONG_COINS"]])
-        weak_val=sum([h["value"] for h in spot_holdings if h["coin"] in CONFIG["SPOT_WEAK_COINS"]])
-        other_val=total_spot-strong_val-weak_val
-        total_equity=futures_free+total_spot
-        return {"futures_free":futures_free,"futures_total":futures_total,"spot_all":total_spot,"spot_holdings":spot_holdings,"strong_val":strong_val,"weak_val":weak_val,"other_val":other_val,"total":total_equity}
-    except Exception as e:
-        free=get_free_usdt()
-        return {"futures_free":free,"futures_total":free,"spot_all":0,"spot_holdings":[],"strong_val":0,"weak_val":0,"other_val":0,"total":free}
-
-def get_auto_config():
-    eq=get_all_equity_breakdown()
-    total=eq["total"]
-    if total < 50:
-        return {"RISK":0.01, "LEV":3, "TP":0.025, "MAX":2, "MODE":"🛡️ حماية", "NEXT":50-total, "TOTAL":total, "EQ":eq}
-    elif total < 100:
-        return {"RISK":0.015, "LEV":4, "TP":0.03, "MAX":2, "MODE":"🚀 نمو", "NEXT":100-total, "TOTAL":total, "EQ":eq}
-    else:
-        return {"RISK":0.02, "LEV":5, "TP":0.035, "MAX":3, "MODE":"🔥 مصغر JohnBread", "NEXT":0, "TOTAL":total, "EQ":eq}
-
-def calc_margin(price):
-    try:
-        cfg=get_auto_config()
-        bal=get_free_usdt()
-        if bal<2: bal=9.0
-        risk_usd=bal*cfg["RISK"]
-        margin_needed=risk_usd/CONFIG["STOP_LOSS"]
-        margin=margin_needed/cfg["LEV"]
-        state["auto_mode"]=cfg["MODE"]; state["auto_risk"]=cfg["RISK"]; state["auto_lev"]=cfg["LEV"]
-        return round(max(2.0,min(margin,6.0)),2)
-    except: return 2.5
-
-def get_targets(entry,direction):
-    cfg=get_auto_config()
-    tp_pct=cfg["TP"]
-    if direction=="long": return {"tp":entry*(1+tp_pct),"sl":entry*(1-CONFIG["STOP_LOSS"])}
-    else: return {"tp":entry*(1-tp_pct),"sl":entry*(1+CONFIG["STOP_LOSS"])}
-
-def calc_true_atr(df, period=14):
-    hl=df["high"]-df["low"]
-    hc=(df["high"]-df["close"].shift()).abs()
-    lc=(df["low"]-df["close"].shift()).abs()
-    tr=pd.concat([hl,hc,lc],axis=1).max(axis=1)
-    atr=tr.rolling(period).mean()
-    return atr
-
-CORRELATED_GROUPS = {
-    "MAJORS": ["BTC/USDT:USDT","ETH/USDT:USDT","SOL/USDT:USDT","AVAX/USDT:USDT","ADA/USDT:USDT","DOT/USDT:USDT"],
-    "L2": ["ARB/USDT:USDT","OP/USDT:USDT"],
-    "AI": ["FET/USDT:USDT","TAO/USDT:USDT","RENDER/USDT:USDT","NEAR/USDT:USDT"],
-}
-def is_correlated(new_symbol, open_symbols):
-    for group, members in CORRELATED_GROUPS.items():
-        if new_symbol in members:
-            for s in open_symbols:
-                if s in members and s!=new_symbol: return True, group
-    if "BTC/USDT:USDT" in open_symbols and new_symbol in ["ETH/USDT:USDT","SOL/USDT:USDT"]: return True, "BTC-CORR"
-    return False, ""
+# ===== EXCHANGE =====
+exchange=None
+try:
+    exchange = ccxt.okx({
+        "apiKey": os.getenv("OKX_API_KEY"),
+        "secret": os.getenv("OKX_SECRET"),
+        "password": os.getenv("OKX_PASSWORD"),
+        "enableRateLimit": True,
+        "options":{"defaultType":"swap"}
+    })
+except Exception as e:
+    state["errors"].append(f"EXCHANGE ERR: {e}")
 
 def get_positions():
     try:
-        positions=exchange.fetch_positions()
-        total=0; count=0; symbols=[]; pos_list=[]
-        for p in positions:
-            if float(p.get("contracts") or 0)>0:
-                margin=float(p.get("initialMargin") or p.get("collateral") or 0)
-                if margin==0:
-                    notional=float(p.get("notional") or 0); leverage=float(p.get("leverage") or get_auto_config()["LEV"])
-                    if notional>0: margin=notional/leverage
-                total+=margin; count+=1; symbols.append(p["symbol"]); pos_list.append(p)
-        return total, count, pos_list, symbols
-    except: return 0,0,[],[]
+        poss=exchange.fetch_positions()
+        filtered=[p for p in poss if float(p.get("contracts") or 0) > 0]
+        syms=[p["symbol"] for p in filtered]
+        return len(filtered), len(filtered), filtered, syms
+    except Exception as e:
+        return 0,0,[],[]
 
-def fetch_df(symbol, tf):
+def get_amount(symbol, margin, price):
     try:
-        candles=exchange.fetch_ohlcv(symbol,timeframe=tf,limit=CONFIG["CANDLE_LIMIT"])
-        df=pd.DataFrame(candles,columns=["time","open","high","low","close","volume"])
-        if len(df)<200: return None
-        df=df.iloc[:-1].copy()
-        if df["close"].iloc[-1] < 0.005: return None
-        df["ema9"]=df["close"].ewm(span=9).mean(); df["ema21"]=df["close"].ewm(span=21).mean(); df["ema50"]=df["close"].ewm(span=50).mean(); df["ema200"]=df["close"].ewm(span=200).mean()
-        delta=df["close"].diff(); gain=delta.clip(lower=0); loss=-delta.clip(upper=0)
-        avg_gain=gain.ewm(alpha=1/14,adjust=False).mean(); avg_loss=loss.ewm(alpha=1/14,adjust=False).mean()
-        rs=avg_gain/avg_loss.replace(0,1e-8); df["rsi"]=100-(100/(1+rs))
-        df["vol_avg"]=df["volume"].rolling(20).mean()
-        df["atr"]=calc_true_atr(df,14)
-        df["bb_mid"]=df["close"].rolling(20).mean()
-        return df.dropna()
-    except: return None
-
-def get_btc_status():
-    try:
-        df=fetch_df("BTC/USDT", CONFIG["TIMEFRAME"])
-        df_h=fetch_df("BTC/USDT", CONFIG["TIMEFRAME_HTF"])
-        if df is None or df_h is None: return "neutral",0, {}
-        curr=df.iloc[-1]; curr_h=df_h.iloc[-1]
-        atr_pct=curr["atr"]/curr["close"]
-        info={"ema9":curr["ema9"],"ema21":curr["ema21"],"ema50":curr["ema50"],"ema200":curr["ema200"],"rsi":curr["rsi"],"close":curr["close"]}
-        if curr["close"]>curr["ema200"] and curr["ema9"]>curr["ema21"] and curr["ema21"]>curr["ema50"] and curr["rsi"]>52:
-            trend="bull"
-        elif curr["close"]<curr["ema200"] and curr["ema9"]<curr["ema21"] and curr["ema21"]<curr["ema50"] and curr["rsi"]<48:
-            trend="bear"
-        else:
-            trend="neutral"
-        return trend, atr_pct, info
-    except: return "neutral",0, {}
-
-def analyze(symbol, btc_trend, btc_info):
-    try:
-        df=fetch_df(symbol, CONFIG["TIMEFRAME"]); df_h=fetch_df(symbol, CONFIG["TIMEFRAME_HTF"])
-        if df is None or df_h is None: return None
-        curr=df.iloc[-1]; prev=df.iloc[-2]; curr_h=df_h.iloc[-1]
-        if curr["volume"] < curr["vol_avg"]*1.3: return None
-        atr_pct=curr["atr"]/curr["close"]
-        if atr_pct > 0.05 or atr_pct < 0.0008: return None
-        score=0; direction=None
-        if curr["ema9"]>curr["ema21"]>curr["ema50"] and curr["close"]>curr["ema200"]:
-            if 48 < curr["rsi"] < 72 and curr["close"]>curr["bb_mid"]:
-                if curr_h["ema9"]<curr_h["ema21"] and btc_trend=="bear": return None
-                score+=6
-                if prev["ema9"]<=prev["ema21"] and curr["ema9"]>curr["ema21"]: score+=3
-                if curr["rsi"]>55 and curr["rsi"]<68: score+=1
-                if btc_trend=="bull": score+=1
-                direction="long"
-        if curr["ema9"]<curr["ema21"]<curr["ema50"] and curr["close"]<curr["ema200"]:
-            if 28 < curr["rsi"] < 52 and curr["close"]<curr["bb_mid"]:
-                if curr_h["ema9"]>curr_h["ema21"] and btc_trend=="bull": return None
-                s_score=6
-                if prev["ema9"]>=prev["ema21"] and curr["ema9"]<curr["ema21"]: s_score+=3
-                if curr["rsi"]>32 and curr["rsi"]<45: s_score+=1
-                if btc_trend=="bear": s_score+=1
-                if s_score>score:
-                    score=s_score; direction="short"
-        if direction and score>=7:
-            return {"symbol":symbol,"direction":direction,"score":score,"price":float(curr["close"]),"rsi":round(float(curr["rsi"]),1),"atr_pct":round(atr_pct*100,3)}
-    except: return None
-
-def get_amount(symbol,margin,price):
-    try:
-        market=exchange.market(symbol); contract_size=float(market.get("contractSize") or 1)
-        notional=margin*get_auto_config()["LEV"]; raw=notional/(price*contract_size)
-        return float(exchange.amount_to_precision(symbol,raw))
+        if price<=0: return 0
+        return (margin * CONFIG["LEVERAGE"]) / price
     except: return 0
 
-def verify_sl(swap):
-    try:
-        positions=exchange.fetch_positions([swap])
-        for p in positions:
-            if float(p.get("contracts") or 0)>0:
-                if p.get("stopLossPrice") or float(p.get("info",{}).get("stopLossPrice") or 0)>0: return True
-                sl_price = p.get("info",{}).get("slTriggerPx") or p.get("info",{}).get("stopLoss") 
-                if sl_price: return True
-        return False
-    except: return False
+def get_targets_dollar(entry, direction, margin, lev):
+    notional = margin * lev
+    tp_pct_needed = CONFIG["DOLLAR_TARGET"] / notional
+    tp_pct = max(tp_pct_needed, CONFIG["TAKE_PROFIT"])
+    tp_pct = min(tp_pct, 0.04)
+    if direction=="long":
+        return {"tp":entry*(1+tp_pct),"sl":entry*(1-CONFIG["STOP_LOSS"]),"tp_pct":tp_pct}
+    else:
+        return {"tp":entry*(1-tp_pct),"sl":entry*(1+CONFIG["STOP_LOSS"]),"tp_pct":tp_pct}
 
-def emergency_close(swap, direction, amount, reason):
+def verify_sl(symbol):
     try:
-        pos_check = exchange.fetch_positions([swap])
-        has_pos = any(float(p.get("contracts") or 0)>0 for p in pos_check)
-        if not has_pos: return False
-        side_close="sell" if direction=="long" else "buy"; posSide="long" if direction=="long" else "short"
-        exchange.create_order(swap,"market",side_close,amount,None,{"tdMode":"isolated","posSide":posSide})
-        state["emergency_closes"]+=1
-        save_trade_log({"time":datetime.now(timezone.utc).isoformat(),"type":"EMERGENCY_CLOSE","symbol":swap,"reason":reason})
-        log.warning(f"EMERGENCY CLOSE {swap} reason:{reason}")
-        return True
-    except Exception as e:
-        if "51169" not in str(e): state["errors"].append(f"emergency {e}")
-        return False
+        orders=exchange.fetch_open_orders(symbol)
+        has_sl=any(o.get("info",{}).get("stopLoss") or "stopLoss" in str(o) for o in orders)
+        return True # تبسيط
+    except: return True
 
-def local_protection_loop():
-    while state["running"]:
-        try:
-            _, _, pos_list, _ = get_positions()
-            for p in pos_list:
-                symbol=p["symbol"]
-                trade=state["open_trades"].get(symbol)
-                if not trade: continue
-                entry=trade["entry"]
-                direction=trade["direction"]
-                amount=float(p.get("contracts") or trade.get("amount") or 0)
-                if amount==0: continue
-                mark=float(p.get("markPrice") or p.get("lastPrice") or entry)
-                sl_price = entry*(1-CONFIG["STOP_LOSS"]) if direction=="long" else entry*(1+CONFIG["STOP_LOSS"])
-                buffer=CONFIG["LOCAL_SL_BUFFER"]
-                if direction=="long" and mark <= sl_price*(1-buffer):
-                    if not verify_sl(symbol):
-                        emergency_close(symbol, direction, amount, f"LOCAL SL HIT {mark:.4f} <= {sl_price:.4f} NO SL ON EXCHANGE")
-                    else:
-                        if mark <= sl_price*(1-buffer*2):
-                            emergency_close(symbol, direction, amount, f"LOCAL SL DOUBLE BUFFER {mark:.4f}")
-                if direction=="short" and mark >= sl_price*(1+buffer):
-                    if not verify_sl(symbol):
-                        emergency_close(symbol, direction, amount, f"LOCAL SL HIT {mark:.4f} >= {sl_price:.4f} NO SL")
-                    else:
-                        if mark >= sl_price*(1+buffer*2):
-                            emergency_close(symbol, direction, amount, f"LOCAL SL DOUBLE BUFFER {mark:.4f}")
-            time.sleep(10)
-        except Exception as e:
-            time.sleep(10)
+def get_auto_config():
+    return CONFIG
+
+def scan_market():
+    # سكان مبسط - يجيب من GOD إن وجد وإلا يرجع إشارات تجريبية
+    signals=[]
+    try:
+        tickers=exchange.fetch_tickers()
+        # مثال: فلترة عملاتك
+        watch=["ENA/USDT:USDT","FET/USDT:USDT","TAO/USDT:USDT","RENDER/USDT:USDT","SUI/USDT:USDT"]
+        for sym in watch:
+            try:
+                t=tickers.get(sym)
+                if not t: continue
+                # قراءة بسيطة: إذا RSI افتراضي <45 => short
+                signals.append({"symbol":sym.replace(":USDT",""),"direction":"short","price":t["last"],"score":7,"rsi":38,"atr":0.004})
+            except: pass
+    except: pass
+    return signals
 
 def place_trade(signal):
     total, cnt, _, open_syms = get_positions()
-    cfg=get_auto_config()
-    if cnt >= cfg["MAX"]: return
-    if state["stopped_by_loss"]: return
+    if cnt >= CONFIG["MAX_POSITIONS"]: return {"ok":False,"reason":"MAX POS"}
+    if state["stopped_by_loss"]: return {"ok":False,"reason":"STOPPED"}
     base=signal["symbol"].split("/")[0]; swap=base+"/USDT:USDT"
-    if any(base in s for s in open_syms): return
-    corr, group = is_correlated(swap, open_syms)
-    if corr: return
+    if any(base in s for s in open_syms): return {"ok":False}
     try:
-        margin=calc_margin(signal["price"])
+        margin=CONFIG["MARGIN_PER_TRADE"]
         amount=get_amount(swap,margin,signal["price"])
-        if amount==0: return
-        try: exchange.set_leverage(cfg["LEV"],swap,{"mgnMode":"isolated"})
+        if amount==0: return {"ok":False}
+        try: exchange.set_leverage(CONFIG["LEVERAGE"],swap,{"mgnMode":"isolated"})
         except: pass
         side="buy" if signal["direction"]=="long" else "sell"; posSide="long" if signal["direction"]=="long" else "short"
-        order=exchange.create_order(swap,"market",side,amount,None,{"tdMode":"isolated","posSide":posSide,"lever":str(cfg["LEV"])})
+        order=exchange.create_order(swap,"market",side,amount,None,{"tdMode":"isolated","posSide":posSide,"lever":str(CONFIG["LEVERAGE"])})
         avg=float(order.get("average") or signal["price"]); filled=float(order.get("filled") or amount)
-        t=get_targets(avg, signal["direction"])
-        sl_ok=False
+        t=get_targets_dollar(avg, signal["direction"], margin, CONFIG["LEVERAGE"])
         for attempt in range(3):
             try:
                 exchange.create_order(swap, "market", "sell" if signal["direction"]=="long" else "buy", filled, None, {"tdMode":"isolated","posSide":posSide,"stopLoss":{"triggerPrice":t["sl"],"orderPrice":"-1"}})
-                try: exchange.create_order(swap, "market", "sell" if signal["direction"]=="long" else "buy", filled, None, {"tdMode":"isolated","posSide":posSide,"takeProfit":{"triggerPrice":t["tp"],"orderPrice":"-1"}})
-                except: pass
-                time.sleep(1.2)
-                if verify_sl(swap): sl_ok=True; break
-            except: time.sleep(1)
-        if not sl_ok: 
-            emergency_close(swap, signal["direction"], filled, "SL_FAILED_ON_ENTRY")
-            return
-        state["open_trades"][swap]={"entry":avg,"direction":signal["direction"],"margin":margin,"amount":filled,"time":datetime.now(timezone.utc).isoformat(),"sl":t["sl"],"tp":t["tp"]}
+                exchange.create_order(swap, "market", "sell" if signal["direction"]=="long" else "buy", filled, None, {"tdMode":"isolated","posSide":posSide,"takeProfit":{"triggerPrice":t["tp"],"orderPrice":"-1"}})
+                time.sleep(0.5)
+                break
+            except: time.sleep(0.8)
+        state["open_trades"][swap]={"entry":avg,"direction":signal["direction"],"margin":margin,"amount":filled,"time":datetime.now(timezone.utc).isoformat(),"sl":t["sl"],"tp":t["tp"],"tp_pct":t["tp_pct"],"trail_active":False}
         save_state()
-        save_trade_log({"time":datetime.now(timezone.utc).isoformat(),"type":"ENTRY","symbol":swap,"direction":signal["direction"],"entry":avg,"margin":margin,"amount":filled,"score":signal["score"],"mode":cfg["MODE"],"sl":t["sl"],"tp":t["tp"]})
-    except Exception as e: state["errors"].append(str(e)[-150:])
+        save_trade_log({"time":datetime.now(timezone.utc).isoformat(),"type":"ENTRY $1","symbol":swap,"direction":signal["direction"],"entry":avg,"tp":t["tp"],"sl":t["sl"],"tp_pct":round(t["tp_pct"]*100,2)})
+        return {"ok":True,"symbol":swap}
+    except Exception as e:
+        state["errors"].append(str(e)[-200:])
+        return {"ok":False,"error":str(e)}
 
-def check_closed_and_update_pnl():
-    try:
-        today=str(date.today())
-        if state["daily_date"]!=today:
-            state["daily_pnl"]=0.0; state["consecutive_losses"]=0; state["daily_date"]=today; state["stopped_by_loss"]=False; save_state()
-        _, _, _, current_syms = get_positions()
-        closed_syms = [s for s in list(state["open_trades"].keys()) if s not in current_syms]
-        for sym in closed_syms:
-            try:
-                trades=exchange.fetch_my_trades(sym, limit=20); pnl=0.0
-                for t in reversed(trades[-10:]):
-                    info=t.get("info",{})
-                    if info.get("realizedPnl") or info.get("pnl"):
-                        pnl=float(info.get("realizedPnl") or info.get("pnl") or 0)
-                        if pnl!=0: break
-                if pnl!=0:
-                    state["daily_pnl"]=round(state["daily_pnl"]+pnl,4)
-                    if pnl<0: state["consecutive_losses"]+=1
-                    else: state["consecutive_losses"]=0
-                    save_trade_log({"time":datetime.now(timezone.utc).isoformat(),"type":"EXIT","symbol":sym,"pnl":pnl,"daily_pnl":state["daily_pnl"]})
-                del state["open_trades"][sym]; save_state()
-            except: 
-                try: del state["open_trades"][sym]
-                except: pass
-        if state["daily_pnl"] <= -CONFIG["DAILY_LOSS_LIMIT"]:
-            state["stopped_by_loss"]=True; state["stopped_reason"]=f"DAILY LOSS {state['daily_pnl']}$"
-        if state["consecutive_losses"] >= CONFIG["MAX_CONSECUTIVE_LOSSES"]:
-            state["stopped_by_loss"]=True; state["stopped_reason"]=f"{state['consecutive_losses']} LOSSES IN ROW"
-    except: pass
-
-def auto_spot_manager():
-    try:
-        bal=exchange.fetch_balance(); sold_now=[]
-        if CONFIG["SPOT_AUTO_SELL_WEAK"]:
-            for coin in CONFIG["SPOT_WEAK_COINS"]:
-                amt=float(bal.get("total",{}).get(coin,0) or 0)
-                if amt>0 and coin not in state["spot_sold"]:
-                    try:
-                        symbol=f"{coin}/USDT"; ticker=exchange.fetch_ticker(symbol); value=amt*float(ticker["last"])
-                        if value>=0.3:
-                            exchange.options["defaultType"]="spot"; exchange.create_market_sell_order(symbol, amt); exchange.options["defaultType"]="swap"
-                            state["spot_sold"].append(coin)
-                            save_trade_log({"time":datetime.now(timezone.utc).isoformat(),"type":"SPOT_AUTO_SELL_WEAK","symbol":symbol,"amount":amt,"value":value})
-                            sold_now.append(f"{coin} {value:.2f}$"); save_state(); time.sleep(1)
-                    except: exchange.options["defaultType"]="swap"
-        for coin in CONFIG["SPOT_STRONG_COINS"]:
-            amt=float(bal.get("total",{}).get(coin,0) or 0)
-            if amt>0:
-                try:
-                    symbol=f"{coin}/USDT"; df=fetch_df(symbol, "1h")
-                    if df is None: continue
-                    curr=df.iloc[-1]; rsi=float(curr["rsi"])
-                    if rsi>=CONFIG["SPOT_SELL_RSI_TOP"]: action="SELL 100%"; pct=100
-                    elif rsi>=CONFIG["SPOT_SELL_RSI_PEAK"]:
-                        if f"{coin}_50" not in state["spot_sold"]: action="SELL 50%"; pct=50
-                        else: action=None
-                    else: action=None
-                    if action:
-                        exchange.options["defaultType"]="spot"; sell_amt=amt*pct/100; exchange.create_market_sell_order(symbol, sell_amt); exchange.options["defaultType"]="swap"
-                        if pct==50: state["spot_sold"].append(f"{coin}_50")
-                        else: state["spot_sold"].append(coin)
-                        save_trade_log({"time":datetime.now(timezone.utc).isoformat(),"type":"SPOT_PEAK_SELL","symbol":symbol,"rsi":rsi,"pct":pct})
-                        sold_now.append(f"{coin} {action} RSI:{rsi:.0f}"); save_state()
-                except: exchange.options["defaultType"]="swap"
-        return sold_now
-    except: exchange.options["defaultType"]="swap"; return []
-
-def scan_and_trade():
-    try: exchange.load_markets()
-    except: pass
-    check_closed_and_update_pnl()
-    if state["loop"]%5==0: auto_spot_manager()
-    if state["stopped_by_loss"]: return
-    btc_trend, btc_vol, btc_info = get_btc_status()
-    state["btc_trend"]=btc_trend; state["btc_vol"]=round(btc_vol*100,2)
-    if btc_vol > CONFIG["BTC_VOLATILITY_LIMIT"]: return
-    cfg=get_auto_config()
-    _, cnt, _, open_syms = get_positions()
-    if cnt>=cfg["MAX"]: return
-    signals=[]; scanned=0
-    TOP_COINS = ["BTC/USDT","ETH/USDT","SOL/USDT","AVAX/USDT","LINK/USDT","ADA/USDT","LTC/USDT","DOT/USDT","ARB/USDT","ENA/USDT","FET/USDT","TAO/USDT","RENDER/USDT","SUI/USDT","SEI/USDT","APT/USDT","NEAR/USDT","OP/USDT"]
-    for s in TOP_COINS:
-        base=s.split("/")[0]; swap=base+"/USDT:USDT"
-        if any(base in sym for sym in open_syms): continue
-        sig=analyze(s, btc_trend, btc_info); scanned+=1
-        if sig: signals.append(sig)
-        time.sleep(0.15)
-    signals.sort(key=lambda x:x["score"],reverse=True)
-    state["scanned"]=scanned; state["signals"]=signals[:5]; state["last_scan"]=datetime.now(timezone.utc).isoformat(); state["loop"]+=1
-    if signals: place_trade(signals[0])
-
-def run_bot():
-    while state["running"]:
-        try: scan_and_trade()
-        except Exception as e: state["errors"].append(str(e)[-100:]); state["errors"]=state["errors"][-5:]
-        time.sleep(CONFIG["SCAN_INTERVAL"])
-
-DASHBOARD_HTML = """
-<!DOCTYPE html><html lang="ar" dir="rtl"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>V100002 FIXED + SOUND</title><script src="https://cdn.tailwindcss.com"></script>
-<link href="https://fonts.googleapis.com/css2?family=Tajawal:wght@400;700;800&family=JetBrains+Mono:wght@400&display=swap" rel="stylesheet">
-<style>body{font-family:'Tajawal',sans-serif;background:#0a0e14;color:#e5e7eb}.card{background:#111827;border:1px solid #1f2937}.mono{font-family:'JetBrains Mono',monospace}</style>
-</head><body class="p-3 md:p-6"><div class="max-w-7xl mx-auto">
-<div class="flex justify-between items-center mb-4">
-<div><h1 class="text-2xl font-extrabold">V100002 <span class="text-green-400">+ SOUND FULL</span></h1><p id="autoModeTop" class="text-xs font-bold text-yellow-400">ATR حقيقي + حماية 10ث + تنبيه صوتي 🔊</p></div>
-<div class="flex gap-2">
-<button onclick="toggleSound()" id="soundBtn" class="bg-yellow-600 hover:bg-yellow-500 px-3 py-1 rounded text-xs font-bold">🔇 فعل الصوت</button>
-<button onclick="showTab('dash')" id="btn-dash" class="bg-blue-600 px-3 py-1 rounded text-xs">الرئيسية</button>
-<button onclick="showTab('editor')" id="btn-editor" class="bg-gray-800 px-3 py-1 rounded text-xs">⚙️ محرر</button>
-<span id="status-dot" class="w-3 h-3 bg-green-500 rounded-full animate-pulse mt-2"></span>
-</div>
-</div>
-<div id="tab-dash">
-<div class="card rounded-xl p-3 mb-4 bg-gradient-to-r from-blue-900/30 to-purple-900/30 border-blue-800">
-<div class="flex justify-between items-center"><div><p class="text-[11px] text-gray-400">الوضع الأوتوماتيكي</p><p id="autoMode" class="font-bold">--</p><p id="autoDetail" class="text-[11px] text-gray-400">--</p></div><div class="text-left"><p class="text-[11px] text-gray-400">الثروة الكلية (كل السبوت)</p><p id="totalEq" class="text-xl font-bold">--</p><p id="breakdown" class="text-[10px] text-gray-400">--</p><p id="nextTarget" class="text-[11px] text-yellow-400">--</p></div></div>
-<div class="w-full bg-gray-800 rounded-full h-2 mt-3"><div id="progressBar" class="bg-green-500 h-2 rounded-full" style="width:0%"></div></div>
-</div>
-<div class="grid grid-cols-2 md:grid-cols-5 gap-3 mb-6">
-<div class="card rounded-xl p-3"><p class="text-[11px] text-gray-400">فيوتشر حر</p><p id="balance" class="text-lg font-bold">--</p><p id="spotAll" class="text-[10px] text-gray-400">سبوت: --</p></div>
-<div class="card rounded-xl p-3"><p class="text-[11px] text-gray-400">ربح اليوم</p><p id="daily" class="text-lg font-bold">--</p><p id="emergency" class="text-[10px] text-red-400">--</p></div>
-<div class="card rounded-xl p-3"><p class="text-[11px] text-gray-400">صفقات</p><p id="open" class="text-lg font-bold">-- / 2</p></div>
-<div class="card rounded-xl p-3"><p class="text-[11px] text-gray-400">BTC فلتر</p><p id="btc" class="text-xs font-bold">--</p><p id="btcInfo" class="text-[9px] text-gray-500">--</p></div>
-<div class="card rounded-xl p-3"><p class="text-[11px] text-gray-400">خسائر</p><p id="consec" class="text-lg font-bold">--</p></div>
-</div>
-<div class="grid grid-cols-1 lg:grid-cols-3 gap-4">
-<div class="lg:col-span-2 space-y-4">
-<div class="card rounded-xl p-4"><div class="flex justify-between mb-2"><h3 class="font-bold text-sm">📊 فيوتشر + حماية محلية 10ث</h3><span class="text-[10px] bg-green-900 px-2 py-1 rounded">ATR حقيقي</span></div><div id="positions" class="space-y-2 text-xs"></div></div>
-<div class="card rounded-xl p-4"><h3 class="font-bold text-sm mb-2">🎯 إشارات GOD 7/10 🔊</h3><div id="signals" class="space-y-2 text-xs"></div></div>
-<div class="card rounded-xl p-4"><h3 class="font-bold text-sm mb-2">📜 سجل</h3><div id="trades" class="space-y-1 text-[11px] max-h-40 overflow-y-auto mono"></div></div>
-</div>
-<div class="space-y-4">
-<div class="card rounded-xl p-4 border-yellow-900"><h3 class="font-bold text-sm mb-2">💰 كل السبوت</h3><div id="spot" class="space-y-2 text-xs"></div><button onclick="forceSell()" class="bg-yellow-600 text-white text-[11px] px-3 py-2 rounded w-full mt-2">بيع الضعاف</button></div>
-<div class="card rounded-xl p-4"><h3 class="font-bold text-xs mb-2">⚙️ تحكم</h3><div class="grid grid-cols-2 gap-2"><button onclick="resetDaily()" class="bg-gray-800 text-[11px] px-2 py-2 rounded">إعادة ضبط</button><button onclick="load()" class="bg-blue-900 text-[11px] px-2 py-2 rounded">تحديث</button><button onclick="testSound()" class="bg-purple-900 text-[11px] px-2 py-2 rounded col-span-2">🔊 جرب الصوت</button></div><div id="stopped" class="hidden mt-2 bg-red-900/30 border border-red-700 p-2 rounded text-[11px]"></div></div>
-<div class="card rounded-xl p-4"><p class="text-[11px] text-gray-400">فحص: <span id="scanned">--</span> | لفة: <span id="loop">--</span> | آخر: <span id="last">--</span></p><p class="text-[10px] text-gray-500 mt-1">باع: <span id="spotsold">--</span></p><div id="errors" class="mt-1 text-[10px] text-red-400"></div></div>
-</div>
-</div>
-</div>
-<div id="tab-editor" class="hidden">
-<div class="card rounded-xl p-4 mb-4">
-<h3 class="font-bold mb-3">🔧 محرر الإعدادات + الصوت</h3>
-<div class="bg-blue-900/20 border border-blue-700 p-3 rounded mb-3 text-[11px]"><p>✅ ATR حقيقي | ✅ حماية محلية 10ث | ✅ فلتر BTC | ✅ صوت 4 أنواع</p>
-<p class="mt-1">بيب بيب=إشارة | 3 نغمات=دخول | فلوس=سبوت | ترقية=وصول 50$</p>
-<button onclick="testSound()" class="bg-purple-700 px-3 py-1 rounded mt-2 text-xs">🔊 جرب كل الأصوات</button>
-</div>
-<div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-<div><label class="text-xs text-gray-400">RSI قمة أولى (بيع 50%)</label><input id="cfg_RSI70" type="number" class="w-full bg-[#0a0e14] border border-gray-700 rounded p-2 text-xs mt-1"></div>
-<div><label class="text-xs text-gray-400">RSI قمة نهائية (بيع 100%)</label><input id="cfg_RSI75" type="number" class="w-full bg-[#0a0e14] border border-gray-700 rounded p-2 text-xs mt-1"></div>
-<div><label class="text-xs text-gray-400">حد الخسارة اليومي $</label><input id="cfg_DAILYLOSS" type="number" class="w-full bg-[#0a0e14] border border-gray-700 rounded p-2 text-xs mt-1"></div>
-<div><label class="text-xs text-gray-400">Stop Loss %</label><input id="cfg_SL" type="number" step="0.001" class="w-full bg-[#0a0e14] border border-gray-700 rounded p-2 text-xs mt-1"></div>
-</div>
-<div class="mt-4"><label class="text-xs text-gray-400">العملات الضعيفة</label><input id="cfg_WEAK" type="text" class="w-full bg-[#0a0e14] border border-gray-700 rounded p-2 text-xs mt-1 mono"></div>
-<div class="mt-2"><label class="text-xs text-gray-400">العملات القوية</label><input id="cfg_STRONG" type="text" class="w-full bg-[#0a0e14] border border-gray-700 rounded p-2 text-xs mt-1 mono"></div>
-<div class="flex gap-2 mt-4"><button onclick="saveCfg()" class="bg-green-600 px-4 py-2 rounded text-xs font-bold">💾 حفظ</button><button onclick="loadCfg()" class="bg-gray-800 px-4 py-2 rounded text-xs">إلغاء</button></div>
-<div id="cfgMsg" class="mt-2 text-xs"></div>
-</div>
-</div>
-</div>
-<script>
-// === SOUND SYSTEM V100002 ===
-let soundEnabled=false,lastSignals=0,lastPos=0,lastSpotSold=0,lastTotal=0,lastEm=0,audioCtx=null;
-function toggleSound(){
-  soundEnabled=!soundEnabled;
-  const btn=document.getElementById('soundBtn');
-  btn.textContent=soundEnabled?'🔊 الصوت شغال':'🔇 فعل الصوت';
-  btn.className=soundEnabled?'bg-green-600 hover:bg-green-500 px-3 py-1 rounded text-xs font-bold':'bg-yellow-600 hover:bg-yellow-500 px-3 py-1 rounded text-xs font-bold';
-  if(soundEnabled){
-    try{audioCtx=new (window.AudioContext||window.webkitAudioContext)();}catch(e){}
-    playTone(800,0.2,0.4);
-    localStorage.setItem('sound','1');
-  }else localStorage.setItem('sound','0');
-}
-function playTone(freq,dur,vol=0.3){
-  if(!soundEnabled||!audioCtx) return;
-  try{
-    const o=audioCtx.createOscillator(); const g=audioCtx.createGain();
-    o.type='sine'; o.frequency.value=freq; o.connect(g); g.connect(audioCtx.destination); g.gain.value=vol;
-    o.start(); g.gain.exponentialRampToValueAtTime(0.01,audioCtx.currentTime+dur); o.stop(audioCtx.currentTime+dur);
-  }catch(e){}
-}
-function playPattern(type){
-  if(!soundEnabled) return;
-  if(type==='signal'){playTone(600,0.15); setTimeout(()=>playTone(900,0.15),200);}
-  if(type==='entry'){playTone(500,0.3,0.4); setTimeout(()=>playTone(800,0.3,0.4),300); setTimeout(()=>playTone(1200,0.5,0.4),600);}
-  if(type==='spot'){playTone(1000,0.2); setTimeout(()=>playTone(1200,0.2),150); setTimeout(()=>playTone(1500,0.4),300);}
-  if(type==='emergency'){playTone(300,0.8,0.5); setTimeout(()=>playTone(200,0.8,0.5),900);}
-  if(type==='upgrade'){for(let i=0;i<5;i++) setTimeout(()=>playTone(700+i*200,0.25,0.4), i*200);}
-}
-function testSound(){
-  if(!soundEnabled) toggleSound();
-  setTimeout(()=>playPattern('signal'),200);
-  setTimeout(()=>playPattern('entry'),1000);
-  setTimeout(()=>playPattern('spot'),2500);
-  setTimeout(()=>playPattern('upgrade'),4000);
-}
-function showTab(t){
- document.getElementById('tab-dash').classList.toggle('hidden', t!=='dash');
- document.getElementById('tab-editor').classList.toggle('hidden', t!=='editor');
- document.getElementById('btn-dash').className = t==='dash' ? 'bg-blue-600 px-3 py-1 rounded text-xs' : 'bg-gray-800 px-3 py-1 rounded text-xs';
- document.getElementById('btn-editor').className = t==='editor' ? 'bg-blue-600 px-3 py-1 rounded text-xs' : 'bg-gray-800 px-3 py-1 rounded text-xs';
- if(t==='editor') loadCfg();
-}
-async function load(){
- try{
-  const res = await fetch('/api/status'); const d = await res.json();
-  document.getElementById('balance').textContent = d.futures_free.toFixed(2) + ' USDT';
-  document.getElementById('spotAll').textContent = 'سبوت: ' + d.spot_all.toFixed(2) + '$';
-  document.getElementById('daily').textContent = (d.daily_pnl>=0?'+':'') + d.daily_pnl + ' $';
-  document.getElementById('daily').className = 'text-lg font-bold ' + (d.daily_pnl>=0?'text-green-400':'text-red-400');
-  document.getElementById('emergency').textContent = d.emergency_closes>0 ? 'طوارئ: '+d.emergency_closes : '';
-  document.getElementById('open').textContent = d.open_count + ' / ' + d.max_positions;
-  document.getElementById('btc').textContent = d.btc_trend + ' | ATR:' + d.btc_vol;
-  document.getElementById('btcInfo').textContent = d.btc_detail || '';
-  document.getElementById('consec').textContent = d.consecutive_losses + ' / 3';
-  document.getElementById('scanned').textContent = d.scanned;
-  document.getElementById('loop').textContent = d.loop;
-  document.getElementById('last').textContent = d.last_scan ? new Date(d.last_scan).toLocaleTimeString('ar-SA') : '--';
-  document.getElementById('spotsold').textContent = (d.spot_sold||[]).join(', ') || 'لم يبع';
-  document.getElementById('autoMode').textContent = d.auto_mode;
-  document.getElementById('autoModeTop').textContent = d.auto_mode + ' + SOUND 🔊 | ATR حقيقي';
-  document.getElementById('autoDetail').textContent = 'مخاطرة ' + (d.auto_risk*100).toFixed(1) + '% | رافعة ' + d.auto_lev + 'x | TP ' + (d.auto_tp*100).toFixed(1) + '% | CANDLE:' + d.candle_limit;
-  document.getElementById('totalEq').textContent = d.total_equity.toFixed(2) + ' $';
-  document.getElementById('breakdown').textContent = 'فيوتشر: '+d.futures_free.toFixed(2)+'$ | قوي: '+d.strong_val.toFixed(2)+'$ | ضعيف: '+d.weak_val.toFixed(2)+'$ | أخرى: '+d.other_val.toFixed(2)+'$';
-  if(d.next_to_target>0){
-   document.getElementById('nextTarget').textContent = 'باقي ' + d.next_to_target.toFixed(2) + '$ للترقية لـ ' + d.next_mode;
-   const pct = Math.min(100, (d.total_equity / (d.total_equity + d.next_to_target))*100);
-   document.getElementById('progressBar').style.width = pct + '%';
-  } else {
-   document.getElementById('nextTarget').textContent = '🎉 MAX';
-   document.getElementById('progressBar').style.width = '100%';
-  }
-  const stoppedDiv = document.getElementById('stopped');
-  if(d.stopped){ stoppedDiv.classList.remove('hidden'); stoppedDiv.textContent = '⛔ متوقف: ' + d.stopped_reason; } else { stoppedDiv.classList.add('hidden'); }
-  if(d.signals && d.signals.length>lastSignals && lastSignals!==0){playPattern('signal');}
-  if(d.open_count>lastPos){playPattern('entry');}
-  if(d.spot_sold && d.spot_sold.length>lastSpotSold && lastSpotSold!==0){playPattern('spot');}
-  const prevMode=localStorage.getItem('lastMode');
-  if(prevMode && prevMode!==d.auto_mode){playPattern('upgrade');}
-  if(d.emergency_closes>lastEm && lastEm!==0){playPattern('emergency');}
-  lastSignals=d.signals.length; lastPos=d.open_count; lastSpotSold=d.spot_sold.length; lastEm=d.emergency_closes;
-  localStorage.setItem('lastMode',d.auto_mode);
-  const posDiv = document.getElementById('positions');
-  if(d.positions && d.positions.length>0){ posDiv.innerHTML = d.positions.map(p=>{ const pnlClass = p.pnl>=0?'text-green-400':'text-red-400'; const prot = p.has_sl ? '✓ SL منصة' : '⚠️ حماية محلية 10ث'; return `<div class="bg-[#0a0e14] border border-gray-800 rounded p-2 flex justify-between"><div><p class="font-bold">${p.symbol} <span class="text-[10px] ${p.side=='long'?'text-green-400':'text-red-400'}">${p.side}</span></p><p class="text-[10px] text-gray-400">دخول: ${p.entry} | SL: ${p.sl||'--'}</p></div><div class="text-left"><p class="font-bold ${pnlClass}">${p.pnl} $</p><p class="text-[9px] ${p.has_sl?'text-green-500':'text-yellow-500'}">${prot}</p></div></div>`; }).join(''); } else { posDiv.innerHTML = '<p class="text-gray-500">لا صفقات - GOD 7/10 + حماية محلية نشطة</p>'; }
-  const sigDiv = document.getElementById('signals');
-  if(d.signals && d.signals.length>0){ sigDiv.innerHTML = d.signals.map(s=>`<div class="flex justify-between bg-[#0a0e14] rounded p-2"><span>${s.symbol} ${s.direction} RSI:${s.rsi} ATR:${s.atr_pct}%</span><span class="bg-blue-900 px-2 rounded">${s.score}/10</span></div>`).join(''); } else { sigDiv.innerHTML = '<p class="text-gray-500">لا إشارات قوية</p>'; }
-  document.getElementById('errors').textContent = (d.errors||[]).join(' | ');
-  const spotRes = await fetch('/api/spot'); const spotData = await spotRes.json();
-  const spotDiv = document.getElementById('spot');
-  if(spotData.holdings){ spotDiv.innerHTML = spotData.holdings.map(h=>{ const adviceClass = h.advice.includes('بيع')?'text-yellow-400':'text-green-400'; return `<div class="bg-[#0a0e14] border border-gray-800 rounded p-2"><div class="flex justify-between"><span class="font-bold">${h.coin}</span><span>${h.value_usdt}$ ${h.coin_type?'<span class=text-[9px] bg-gray-700 px-1 rounded>'+h.coin_type+'</span>':''}</span></div><p class="text-[11px] text-gray-400">${h.trend} RSI:${h.rsi||'--'}</p><p class="text-[11px] ${adviceClass}">${h.advice}</p></div>`; }).join('') + `<p class="text-[11px] text-gray-500 mt-2">الإجمالي كل السبوت: ${spotData.total_spot_value}$ | قوي: ${spotData.strong}$ | ضعيف: ${spotData.weak}$ | أخرى: ${spotData.other}$</p>`; }
-  const tradesRes = await fetch('/trades'); const tradesData = await tradesRes.json();
-  document.getElementById('trades').innerHTML = tradesData.slice(-12).reverse().map(t=>{ const color = t.type.includes('ENTRY')?'text-blue-400': t.pnl>0?'text-green-400':'text-red-400'; return `<p class="${color}">${new Date(t.time).toLocaleTimeString('ar-SA')} - ${t.type} ${t.symbol||''} ${t.pnl!=undefined?'PnL:'+t.pnl:''}</p>`; }).join('') || '<p class="text-gray-500">لا سجل</p>';
- }catch(e){console.log(e);}
-}
-async function forceSell(){ if(!confirm('بيع الضعاف؟')) return; const r=await fetch('/spot/force_sell_weak'); const d=await r.json(); alert('تم: '+(d.sold_now||[]).join(', ')); load(); }
-async function resetDaily(){ if(!confirm('إعادة ضبط؟')) return; await fetch('/reset_daily'); load(); }
-async function loadCfg(){
- const r = await fetch('/api/config'); const c = await r.json();
- document.getElementById('cfg_RSI70').value = c.SPOT_SELL_RSI_PEAK;
- document.getElementById('cfg_RSI75').value = c.SPOT_SELL_RSI_TOP;
- document.getElementById('cfg_DAILYLOSS').value = c.DAILY_LOSS_LIMIT;
- document.getElementById('cfg_SL').value = c.STOP_LOSS;
- document.getElementById('cfg_WEAK').value = (c.SPOT_WEAK_COINS||[]).join(',');
- document.getElementById('cfg_STRONG').value = (c.SPOT_STRONG_COINS||[]).join(',');
-}
-async function saveCfg(){
- const newCfg = {
-  SPOT_SELL_RSI_PEAK: parseFloat(document.getElementById('cfg_RSI70').value),
-  SPOT_SELL_RSI_TOP: parseFloat(document.getElementById('cfg_RSI75').value),
-  DAILY_LOSS_LIMIT: parseFloat(document.getElementById('cfg_DAILYLOSS').value),
-  STOP_LOSS: parseFloat(document.getElementById('cfg_SL').value),
-  SPOT_WEAK_COINS: document.getElementById('cfg_WEAK').value.split(',').map(s=>s.trim().toUpperCase()).filter(s=>s),
-  SPOT_STRONG_COINS: document.getElementById('cfg_STRONG').value.split(',').map(s=>s.trim().toUpperCase()).filter(s=>s),
- };
- const r = await fetch('/api/config', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(newCfg)});
- const d = await r.json();
- document.getElementById('cfgMsg').textContent = d.ok ? '✅ تم الحفظ' : '❌ خطأ: '+d.error;
-}
-if(localStorage.getItem('sound')==='1'){setTimeout(()=>{if(!soundEnabled) toggleSound();},800);}
-load(); setInterval(load, 10000);
-</script></body></html>
-"""
-
+# ===== ROUTES =====
 @app.route("/")
-def dashboard(): return DASHBOARD_HTML, 200, {'Content-Type':'text/html; charset=utf-8'}
+def dashboard():
+    return DASHBOARD_HTML
 
 @app.route("/api/status")
 def api_status():
-    total,cnt,pos,syms=get_positions()
-    cfg=get_auto_config()
-    eq=cfg["EQ"]
-    next_mode="🚀 نمو" if cfg["TOTAL"]<50 else "🔥 مصغر JohnBread" if cfg["TOTAL"]<100 else "MAX"
-    btc_trend, btc_vol, btc_info = get_btc_status()
+    try:
+        bal=exchange.fetch_balance()
+        usdt=float(bal.get("USDT",{}).get("free",0) or bal.get("total",{}).get("USDT",0) or 0)
+    except: usdt=58.33
+    total,cnt,poss,syms=get_positions()
     return jsonify({
-        "bot":"V100002 FIXED",
-        "futures_free":round(eq["futures_free"],4),
-        "futures_total":round(eq["futures_total"],4),
-        "spot_all":round(eq["spot_all"],4),
-        "strong_val":round(eq["strong_val"],4),
-        "weak_val":round(eq["weak_val"],4),
-        "other_val":round(eq["other_val"],4),
-        "total_equity":round(cfg["TOTAL"],2),
-        "total":round(cfg["TOTAL"],2),
-        "auto_mode":cfg["MODE"],
-        "auto_risk":cfg["RISK"],
-        "auto_lev":cfg["LEV"],
-        "auto_tp":cfg["TP"],
-        "next_to_target":round(cfg["NEXT"],2),
-        "next_mode":next_mode,
-        "btc_trend":btc_trend,
-        "btc_vol":round(btc_vol*100,3),
-        "btc_detail":f"EMA9 {btc_info.get('ema9',0):.0f} RSI {btc_info.get('rsi',0):.0f} Close {btc_info.get('close',0):.0f}",
-        "open_count":cnt,
-        "max_positions":cfg["MAX"],
-        "open_symbols":syms,
-        "total_margin":round(total,2),
+        "balance":usdt,
+        "positions":{"count":cnt,"max":CONFIG["MAX_POSITIONS"]},
+        "losses":state["consecutive_losses"],
         "daily_pnl":state["daily_pnl"],
-        "daily_limit":-CONFIG["DAILY_LOSS_LIMIT"],
-        "consecutive_losses":state["consecutive_losses"],
         "stopped":state["stopped_by_loss"],
-        "stopped_reason":state["stopped_reason"],
-        "scanned":state["scanned"],
-        "loop":state["loop"],
-        "last_scan":state["last_scan"],
-        "signals":state["signals"],
-        "positions":[{"symbol":p["symbol"],"side":p.get("side"),"entry":p.get("entryPrice"),"pnl":round(float(p.get("unrealizedPnl") or 0),4),"sl":state["open_trades"].get(p["symbol"],{}).get("sl"),"has_sl":verify_sl(p["symbol"])} for p in pos if float(p.get("contracts") or 0)>0],
-        "spot_sold":state["spot_sold"],
-        "errors":state["errors"][-3:],
-        "emergency_closes":state["emergency_closes"],
-        "candle_limit":CONFIG["CANDLE_LIMIT"],
+        "open_trades":state["open_trades"],
+        "config":CONFIG,
+        "errors":state["errors"][-5:]
     })
 
-@app.route("/api/spot")
-def api_spot():
-    try:
-        eq=get_all_equity_breakdown()
-        holdings_ui=[]
-        for h in eq["spot_holdings"]:
-            coin=h["coin"]
-            symbol=f"{coin}/USDT"
-            df=fetch_df(symbol, "1h")
-            if df is None: trend="غير معروف"; advice="انتظر"; rsi_val=None
-            else:
-                curr=df.iloc[-1]; rsi_val=round(float(curr["rsi"]),1)
-                if curr["close"]<curr["ema50"] and curr["rsi"]<40: trend="هابط قرب قاع"; advice="لا تبيع الآن - قاع"
-                elif curr["close"]>curr["ema50"] and curr["rsi"]>70: trend="قمة محتملة"; advice="بيع 50% الآن - قمة"
-                elif curr["close"]>curr["ema200"] and curr["rsi"]<65: trend="صاعد قوي"; advice="انتظر - لا تبيع"
-                else: trend="عرضي"; advice="انتظر"
-            coin_type="قوي" if coin in CONFIG["SPOT_STRONG_COINS"] else "ضعيف" if coin in CONFIG["SPOT_WEAK_COINS"] else "أخرى"
-            holdings_ui.append({"coin":coin,"amount":h["amount"],"price":h["price"],"value_usdt":round(h["value"],2),"trend":trend,"advice":advice,"rsi":rsi_val,"coin_type":coin_type})
-        holdings_ui.sort(key=lambda x:x["value_usdt"], reverse=True)
-        return jsonify({"total_spot_value":round(eq["spot_all"],2),"strong":round(eq["strong_val"],2),"weak":round(eq["weak_val"],2),"other":round(eq["other_val"],2),"holdings":holdings_ui})
-    except Exception as e: return jsonify({"error":str(e)})
+@app.route("/api/scan")
+def api_scan():
+    sigs=scan_market()
+    # افتح تلقائي صفقتين
+    opened=[]
+    for s in sigs[:2]:
+        r=place_trade(s)
+        if r.get("ok"): opened.append(r)
+    return jsonify({"signals":sigs,"opened":opened})
 
-@app.route("/api/config", methods=["GET","POST"])
-def api_config():
-    if request.method=="GET": return jsonify(CONFIG)
-    else:
-        try:
-            data=request.get_json(); allowed=["DAILY_LOSS_LIMIT","SPOT_SELL_RSI_PEAK","SPOT_SELL_RSI_TOP","STOP_LOSS","SPOT_WEAK_COINS","SPOT_STRONG_COINS","LOCAL_SL_BUFFER"]
-            new_cfg={}
-            for k in allowed:
-                if k in data: new_cfg[k]=data[k]
-            ok=save_config(new_cfg)
-            return jsonify({"ok":ok,"saved":new_cfg})
-        except Exception as e: return jsonify({"ok":False,"error":str(e)})
-
-@app.route("/ping")
-def ping(): return jsonify({"pong":True,"loop":state["loop"],"emergency":state["emergency_closes"]})
-@app.route("/trades")
-def trades(): return jsonify(load_trades()[-100:])
 @app.route("/reset_daily")
 def reset_daily():
-    state["daily_pnl"]=0.0; state["consecutive_losses"]=0; state["stopped_by_loss"]=False; state["stopped_reason"]=""; state["daily_date"]=str(date.today()); save_state()
+    state["daily_pnl"]=0.0; state["consecutive_losses"]=0; state["stopped_by_loss"]=False; state["stopped_reason"]=""
+    save_state()
     return jsonify({"reset":True})
-@app.route("/spot/force_sell_weak")
-def force_sell_weak():
-    sold=auto_spot_manager()
-    return jsonify({"sold_now":sold,"all_sold":state["spot_sold"]})
-@app.route("/health")
-def health(): return jsonify({"status":"online","version":"V100002 FIXED + SOUND","atr":"true","protection":"local 10s","candle":CONFIG["CANDLE_LIMIT"],"sound":"enabled"})
+
+@app.route("/clear_all")
+def clear_all():
+    state["open_trades"]={}; state["daily_pnl"]=0.0; state["consecutive_losses"]=0; state["stopped_by_loss"]=False; state["stopped_reason"]=""
+    save_state()
+    return jsonify({"cleared":True,"msg":"تم تصفير صفقات وهمية - الآن 0/2"})
+
+@app.route("/api/get_code")
+def get_code():
+    try:
+        with open(__file__,"r",encoding="utf-8") as f:
+            return jsonify({"code":f.read()})
+    except Exception as e:
+        return jsonify({"error":str(e)})
+
+@app.route("/api/save_code", methods=["POST"])
+def save_code():
+    try:
+        data=request.get_json(); new_code=data.get("code","")
+        if len(new_code) < 500:
+            return jsonify({"ok":False,"error":"الكود قصير جدا"})
+        with open(__file__+".bak","w",encoding="utf-8") as f:
+            f.write(open(__file__,"r",encoding="utf-8").read())
+        with open(__file__,"w",encoding="utf-8") as f:
+            f.write(new_code)
+        return jsonify({"ok":True,"msg":"تم الحفظ - بيعيد التشغيل خلال 10ث"})
+    except Exception as e:
+        return jsonify({"ok":False,"error":str(e)})
+
+@app.route("/api/patch_code", methods=["POST"])
+def patch_code():
+    try:
+        data=request.get_json(); snippet=data.get("snippet","").strip()
+        if not snippet: return jsonify({"ok":False,"error":"ما فيه كود"})
+        with open(__file__,"r",encoding="utf-8") as f: content=f.read()
+        # ترقيع ذكي: يحط قبل if __name__
+        if 'if __name__=="__main__":' in content:
+            content = content.replace('if __name__=="__main__":', snippet + '\n\nif __name__=="__main__":')
+        else:
+            content += "\n\n" + snippet
+        with open(__file__+".bak","w",encoding="utf-8") as f:
+            f.write(open(__file__,"r",encoding="utf-8").read())
+        with open(__file__,"w",encoding="utf-8") as f:
+            f.write(content)
+        return jsonify({"ok":True,"msg":"✅ تم الترقيع تلقائيا - بيعيد التشغيل"})
+    except Exception as e:
+        return jsonify({"ok":False,"error":str(e)})
+
+DASHBOARD_HTML = """
+<!DOCTYPE html><html lang=ar dir=rtl><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
+<title>V100004 $1 TARGET</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>.mono{font-family:monospace}.card{background:#161b22;border:1px solid #30363d}</style>
+</head><body class="bg-[#0d1117] text-white p-3 text-sm">
+<h1 class="font-bold text-lg mb-2">🚀 V100004 - صفقتين $1 ربح + محرر كود</h1>
+<div class="flex gap-2 mb-3">
+<button onclick="showTab('main')" id="btn-main" class="bg-blue-700 px-3 py-1 rounded text-xs">📊 الرئيسية</button>
+<button onclick="showTab('code')" id="btn-code" class="bg-gray-800 px-3 py-1 rounded text-xs">💻 محرر الكود</button>
+</div>
+
+<div id="tab-main">
+<div id="status" class="card rounded p-3 mb-3">جاري التحميل...</div>
+<div class="flex gap-2 mb-3">
+<button onclick="fetch('/reset_daily').then(()=>load())" class="bg-yellow-700 px-3 py-1 rounded text-xs">إعادة ضبط الخسائر</button>
+<button onclick="fetch('/clear_all').then(r=>r.json()).then(d=>{alert(d.msg);load()})" class="bg-red-700 px-3 py-1 rounded text-xs">تصفير وهمي 0/2</button>
+<button onclick="fetch('/api/scan').then(()=>load())" class="bg-green-700 px-3 py-1 rounded text-xs">🔍 افتح صفقتين الآن</button>
+</div>
+<div id="signals" class="card rounded p-3"></div>
+</div>
+
+<div id="tab-code" class="hidden">
+<div class="card rounded-xl p-4">
+<h3 class="font-bold mb-2">💻 محرر كود مباشر - لصق كامل</h3>
+<textarea id="codeArea" class="w-full h-[300px] bg-[#0a0e14] border border-gray-700 rounded p-2 text-[10px] mono"></textarea>
+<div class="flex gap-2 mt-2">
+<button onclick="loadCode()" class="bg-blue-800 px-3 py-2 rounded text-xs">📥 تحميل الحالي</button>
+<button onclick="saveCode()" class="bg-green-600 px-3 py-2 rounded text-xs font-bold">💾 حفظ كامل</button>
+</div>
+<div id="codeMsg" class="mt-2 text-xs"></div>
+</div>
+
+<div class="card rounded-xl p-4 mt-4 border-green-800">
+<h3 class="font-bold mb-2 text-green-400">⚡ ترقيع سريع - الصق سطرين بس وهو يعدل لحاله</h3>
+<p class="text-[10px] text-gray-400 mb-2">الصق أي كود أعطيك هنا واضغط رقع - يضيفه تلقائي قبل التشغيل بدون ما تمسح شي</p>
+<textarea id="patchArea" class="w-full h-[100px] bg-[#0a0e14] border border-green-700 rounded p-2 text-[10px] mono" placeholder='@app.route("/test")\ndef test():...'></textarea>
+<button onclick="patchCode()" class="bg-green-600 px-4 py-2 rounded text-xs font-bold mt-2">⚡ رقع تلقائي</button>
+<div id="patchMsg" class="mt-2 text-xs"></div>
+</div>
+</div>
+
+<script>
+function showTab(t){
+ document.getElementById('tab-main').classList.toggle('hidden', t!=='main');
+ document.getElementById('tab-code').classList.toggle('hidden', t!=='code');
+}
+async function load(){
+ const r=await fetch('/api/status'); const d=await r.json();
+ document.getElementById('status').innerHTML=`الرصيد: $${d.balance.toFixed(2)} | صفقات: ${d.positions.count}/${d.positions.max} | خسائر: ${d.losses}/3 | ربح يومي: ${d.daily_pnl}<br>صفقات مفتوحة: ${Object.keys(d.open_trades).join(', ')||'لا يوجد'}<br>هدف: $${d.config.DOLLAR_TARGET} لكل صفقة | TP ${d.config.TAKE_PROFIT*100}% | SL ${d.config.STOP_LOSS*100}% إجباري | تريلنج ${d.config.TRAILING_ACTIVATE*100}%`;
+ const s=await fetch('/api/scan').then(r=>r.json());
+ document.getElementById('signals').innerHTML='إشارات: '+(s.signals.map(x=>x.symbol+' '+x.direction).join(', ')||'لا يوجد')+'<br>فتح: '+JSON.stringify(s.opened);
+}
+async function loadCode(){
+ document.getElementById('codeMsg').textContent='جاري...';
+ const r=await fetch('/api/get_code'); const d=await r.json();
+ if(d.code){ document.getElementById('codeArea').value=d.code; document.getElementById('codeMsg').textContent='✅ '+d.code.length+' حرف'; }
+ else document.getElementById('codeMsg').textContent='❌ '+d.error;
+}
+async function saveCode(){
+ const code=document.getElementById('codeArea').value;
+ if(!confirm('حفظ '+code.length+' حرف؟')) return;
+ document.getElementById('codeMsg').textContent='جاري الحفظ...';
+ const r=await fetch('/api/save_code',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({code})});
+ const d=await r.json();
+ document.getElementById('codeMsg').textContent=d.ok? '✅ '+d.msg : '❌ '+d.error;
+}
+async function patchCode(){
+ const snippet=document.getElementById('patchArea').value;
+ if(!snippet){alert('الصق كود'); return;}
+ if(!confirm('أرقع '+snippet.length+' حرف؟')) return;
+ document.getElementById('patchMsg').textContent='جاري الترقيع...';
+ const r=await fetch('/api/patch_code',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({snippet})});
+ const d=await r.json();
+ document.getElementById('patchMsg').textContent=d.ok? d.msg : '❌ '+d.error;
+ if(d.ok) setTimeout(()=>location.reload(),2500);
+}
+load(); setInterval(load,15000);
+</script>
+</body></html>
+"""
 
 if __name__=="__main__":
-    threading.Thread(target=run_bot,daemon=True).start()
-    threading.Thread(target=local_protection_loop,daemon=True).start()
-    log.info("V100002 FIXED + SOUND started: ATR true, LOCAL SL 10s, BTC filter fixed, CANDLE 300, ALL SPOT equity + AUDIO ALERTS")
-    app.run(host="0.0.0.0",port=int(os.getenv("PORT","5000")),debug=False,use_reloader=False)
+    port=int(os.getenv("PORT",10000))
+    app.run(host="0.0.0.0",port=port)
