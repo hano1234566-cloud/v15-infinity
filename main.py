@@ -1,19 +1,55 @@
 import os, time, threading, ccxt
 from flask import Flask, jsonify, request
 import numpy as np
+from datetime import datetime, timezone
 
 API_KEY = os.getenv("OKX_API_KEY","").strip()
 SECRET = (os.getenv("OKX_SECRET_KEY","") or os.getenv("OKX_SECRET","")).strip()
 PASSPHRASE = os.getenv("OKX_PASSPHRASE","").strip()
 
-BAL=21.04
-LAST="V20012 DIRECT + BALANCE - مباشر مع رصيد"
-STATE={"open":{}, "daily":0, "stopped":False}
+BAL = 0.0
+LAST = "V20013 FIXED - رصيد حقيقي + مباشر"
+STATE = {"open":{}, "daily":0, "stopped":False}
 
 app = Flask(__name__)
 
 def get_ex():
     return ccxt.okx({'apiKey':API_KEY,'secret':SECRET,'password':PASSPHRASE,'options':{'defaultType':'swap'},'enableRateLimit':True})
+
+def get_real_balance():
+    global BAL
+    try:
+        ex = get_ex()
+        # الطريقة الأكيدة لقراءة رصيد OKX
+        try:
+            resp = ex.private_get_account_balance()
+            data = resp.get('data', [])
+            if data and len(data)>0:
+                details = data[0].get('details', [])
+                for item in details:
+                    if item.get('ccy') == 'USDT':
+                        eq = float(item.get('eq',0) or 0)
+                        avail = float(item.get('availBal',0) or item.get('availEq',0) or 0)
+                        BAL = avail if avail>0 else eq
+                        if BAL>0:
+                            return BAL
+        except Exception as e:
+            pass
+        
+        # fallback
+        try:
+            bal = ex.fetch_balance()
+            usdt = float(bal.get('total',{}).get('USDT',0) or 0)
+            if usdt==0:
+                usdt = float(bal.get('USDT',{}).get('total',0) or 0)
+            if usdt>0:
+                BAL = usdt
+                return BAL
+        except: pass
+        
+        return BAL
+    except:
+        return BAL
 
 def calc_rsi(prices, p=14):
     try:
@@ -31,7 +67,8 @@ def calc_rsi(prices, p=14):
     except: return 50.0
 
 def scan_live():
-    sigs=[]; WATCH=["ENA/USDT:USDT","FET/USDT:USDT","TAO/USDT:USDT","RENDER/USDT:USDT","SUI/USDT:USDT"]
+    sigs=[]
+    WATCH=["ENA/USDT:USDT","FET/USDT:USDT","TAO/USDT:USDT","RENDER/USDT:USDT","SUI/USDT:USDT"]
     ex=get_ex()
     try: tickers=ex.fetch_tickers()
     except: tickers={}
@@ -55,19 +92,16 @@ def hunter():
     global BAL, LAST
     while True:
         try:
-            ex=get_ex()
-            try:
-                b=ex.fetch_balance()
-                BAL=float(b.get("total",{}).get("USDT",0) or b.get("USDT",{}).get("total",0) or BAL)
-            except: pass
+            BAL = get_real_balance()
             
-            # تريلنج SL
+            # تريلنج
             for sym,data in list(STATE["open"].items()):
                 try:
+                    ex=get_ex()
                     tk=ex.fetch_ticker(sym)
                     last=tk["last"]; entry=data["entry"]
                     pnl_pct=(last-entry)/entry if data["dir"]=="long" else (entry-last)/entry
-                    pnl_usd=pnl_pct*2.2*5
+                    pnl_usd=pnl_pct*1.0*5
                     if pnl_usd>data["best"]: data["best"]=pnl_usd
                     if pnl_usd>=0.70: data["trail"]=True
                     if data["trail"]:
@@ -80,60 +114,77 @@ def hunter():
                         if pnl_usd>=2.00: locked=1.40
                         if locked>data["locked"]:
                             data["locked"]=locked
-                            LAST=f"SL يضمن ${locked} ربح ${pnl_usd:.2f}"
+                            LAST=f"SL يضمن ${locked} ربح ${pnl_usd:.2f} رصيد ${BAL:.2f}"
                 except: pass
 
             # اغلاق
             try:
+                ex=get_ex()
                 positions=ex.fetch_positions()
                 open_syms=[p["symbol"] for p in positions if float(p.get("contracts",0))>0]
                 for sym in list(STATE["open"].keys()):
                     if sym not in open_syms:
                         d=STATE["open"].pop(sym)
                         STATE["daily"]+=d.get("best",0)
-                        LAST=f"اغلق {d['name']} ${d.get('best',0):.2f}"
+                        BAL = get_real_balance()
+                        LAST=f"اغلق {d['name']} ${d.get('best',0):.2f} رصيد ${BAL:.2f}"
             except: pass
 
-            # فتح مباشر
+            # فتح مباشر - مصحح 51008
             if not STATE["stopped"] and len(STATE["open"])<1:
                 sigs=scan_live()
                 if sigs:
                     sig=sigs[0]
                     try:
+                        ex=get_ex()
                         ex.set_leverage(5, sig["full"])
                         side="buy" if sig["direction"]=="long" else "sell"
-                        amount=(2.2*5)/sig["price"]
+                        margin_use = 1.0
+                        if BAL < 1.5:
+                            LAST=f"رصيد قليل ${BAL:.2f} - انقل من Funding الى Trading"
+                            time.sleep(10)
+                            continue
+                        amount=(margin_use*5)/sig["price"]
                         amount=max(amount,1.0)
                         amount=float(ex.amount_to_precision(sig["full"], amount))
-                        try: order=ex.create_market_order(sig["full"], side, amount, None, {'tdMode':'isolated'})
-                        except: order=ex.create_market_order(sig["full"], side, amount, None, {'tdMode':'isolated','posSide':'long' if side=='buy' else 'short'})
+                        # cross يحل 51008
+                        try:
+                            order=ex.create_market_order(sig["full"], side, amount, None, {'tdMode':'cross'})
+                        except:
+                            try:
+                                order=ex.create_market_order(sig["full"], side, amount, None, {'tdMode':'isolated'})
+                            except:
+                                order=ex.create_market_order(sig["full"], side, amount, None, {'tdMode':'isolated','posSide':'long' if side=='buy' else 'short'})
                         entry=order.get("average") or sig["price"]
                         STATE["open"][sig["full"]]={"name":sig["symbol"],"dir":sig["direction"],"entry":entry,"sl":entry*0.992 if side=="buy" else entry*1.008,"best":0,"locked":0,"trail":False}
-                        LAST=f"فتح مباشر {sig['direction'].upper()} {sig['symbol']} {entry:.4f}"
+                        BAL = get_real_balance()
+                        LAST=f"✅ فتح {sig['direction'].upper()} {sig['symbol']} {entry:.4f} رصيد ${BAL:.2f}"
                     except Exception as e:
-                        LAST=f"OKX: {str(e)[:120]}"
+                        LAST=f"❌ {str(e)[:200]} رصيد ${BAL:.2f}"
             time.sleep(3)
         except Exception as e:
-            LAST=f"خطأ {str(e)[:100]}"; time.sleep(3)
+            LAST=f"خطأ {str(e)[:120]}"; time.sleep(3)
 
 @app.route("/")
 def index(): return DASH_HTML
 
 @app.route("/api/status")
 def status():
-    return jsonify({"balance":BAL,"daily":STATE["daily"],"count":len(STATE["open"]),"last":LAST,"stopped":STATE["stopped"]})
+    b = get_real_balance()
+    return jsonify({"balance":b,"daily":STATE["daily"],"count":len(STATE["open"]),"last":LAST,"stopped":STATE["stopped"]})
 
 @app.route("/api/scan")
 def scan(): return jsonify({"signals":scan_live()})
 
 @app.route("/api/pnl_live")
 def pnl_live():
-    live=[]; ex=get_ex()
+    live=[]
+    ex=get_ex()
     for sym,data in STATE["open"].items():
         try:
             tk=ex.fetch_ticker(sym); last=tk["last"]; entry=data["entry"]
             pnl_pct=(last-entry)/entry if data["dir"]=="long" else (entry-last)/entry
-            pnl_usd=pnl_pct*2.2*5
+            pnl_usd=pnl_pct*1.0*5
             live.append({"symbol":data["name"],"dir":data["dir"],"pnl":round(pnl_usd,2),"entry":entry,"last":last,"best":round(data["best"],2),"locked":round(data["locked"],2),"sl":data["sl"],"trail":data["trail"]})
         except: pass
     return jsonify({"live":live})
@@ -143,13 +194,13 @@ def get_code():
     with open(__file__,"r",encoding="utf-8") as f: return jsonify({"code":f.read()})
 
 DASH_HTML = """
-<!DOCTYPE html><html lang=ar dir=rtl><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>DIRECT + BALANCE</title><script src="https://cdn.tailwindcss.com"></script>
+<!DOCTYPE html><html lang=ar dir=rtl><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>FIXED BALANCE</title><script src="https://cdn.tailwindcss.com"></script>
 <style>body{background:#0a0e14}.glass{background:#121a26;border:1px solid #1e2d42}</style>
 </head><body class="text-white p-3">
 <div class="glass rounded-[20px] p-5 mb-4">
 <div class="flex justify-between items-start">
-<div><div class="text-[11px] text-gray-400">الرصيد الحقيقي</div><div id="bal" class="text-[32px] font-black">$21.04</div><div id="last" class="text-[11px] text-yellow-300 mt-1">...</div></div>
-<div class="text-left"><div class="text-[11px] text-gray-400">صفقات مفتوحة</div><div id="cnt" class="text-[20px] font-bold">0/1</div><div id="daily" class="text-[11px] text-green-400">$0.00 اليوم</div></div>
+<div><div class="text-[11px] text-gray-400">الرصيد الحقيقي OKX</div><div id="bal" class="text-[36px] font-black">$0.00</div><div id="last" class="text-[11px] text-yellow-300 mt-1">جاري قراءة الرصيد...</div></div>
+<div class="text-left"><div class="text-[11px] text-gray-400">صفقات</div><div id="cnt" class="text-[22px] font-bold">0/1</div><div id="daily" class="text-[11px] text-green-400">$0.00 اليوم</div></div>
 </div>
 </div>
 <div id="liveBig" class="mb-4"></div>
@@ -168,10 +219,10 @@ async function load(){
  const big=document.getElementById('liveBig');
  if(pnl.live.length>0){
   let h=''; pnl.live.forEach(x=>{
-   h+=`<div class="glass rounded-[20px] p-5 border-2 ${x.pnl>=1?'border-green-500 bg-green-500/10':'border-yellow-500/40'}"><div class="flex justify-between items-center"><span class="font-black text-[18px]">${x.symbol} ${x.dir.toUpperCase()}</span><span class="px-4 py-1 rounded-full font-black text-[16px] ${x.pnl>=0?'bg-green-500 text-black':'bg-red-500'}">${x.pnl>=0?'+':''}$${x.pnl}</span></div><div class="grid grid-cols-4 gap-2 mt-4 text-[12px]"><div class="bg-black/40 rounded-xl p-3 text-center"><div class="text-gray-400 text-[10px]">دخول</div><div class="font-bold">${x.entry.toFixed(4)}</div></div><div class="bg-black/40 rounded-xl p-3 text-center"><div class="text-gray-400 text-[10px]">حالي</div><div class="font-bold text-yellow-300">${x.last.toFixed(4)}</div></div><div class="bg-black/40 rounded-xl p-3 text-center"><div class="text-gray-400 text-[10px]">SL</div><div class="font-bold">${x.sl.toFixed(4)}</div></div><div class="bg-black/40 rounded-xl p-3 text-center"><div class="text-gray-400 text-[10px]">مضمون</div><div class="font-black text-green-400 text-[16px]">$${x.locked}</div></div></div><div class="mt-3 text-[11px] text-gray-400">أفضل $${x.best} | ${x.trail?'🔥 SL يطلع كل $0.20':'⏳ ينتظر $0.70'} | هدف $1+ مفتوح</div></div>`;
+   h+=`<div class="glass rounded-[20px] p-5 border-2 ${x.pnl>=1?'border-green-500 bg-green-500/10':'border-yellow-500/40'}"><div class="flex justify-between items-center"><span class="font-black text-[18px]">${x.symbol} ${x.dir.toUpperCase()}</span><span class="px-4 py-1 rounded-full font-black text-[16px] ${x.pnl>=0?'bg-green-500 text-black':'bg-red-500'}">${x.pnl>=0?'+':''}$${x.pnl}</span></div><div class="grid grid-cols-4 gap-2 mt-4 text-[12px]"><div class="bg-black/40 rounded-xl p-3 text-center"><div class="text-gray-400 text-[10px]">دخول</div><div class="font-bold">${x.entry.toFixed(4)}</div></div><div class="bg-black/40 rounded-xl p-3 text-center"><div class="text-gray-400 text-[10px]">حالي</div><div class="font-bold text-yellow-300">${x.last.toFixed(4)}</div></div><div class="bg-black/40 rounded-xl p-3 text-center"><div class="text-gray-400 text-[10px]">SL</div><div class="font-bold">${x.sl.toFixed(4)}</div></div><div class="bg-black/40 rounded-xl p-3 text-center"><div class="text-gray-400 text-[10px]">مضمون</div><div class="font-black text-green-400 text-[16px]">$${x.locked}</div></div></div></div>`;
   }); big.innerHTML=h;
  } else {
-  big.innerHTML=`<div class="glass rounded-2xl p-6 text-center border-dashed"><div class="text-[14px]">🔴 يبحث عن صفقة مباشرة...</div><div class="text-[11px] text-gray-500 mt-1">يفتح تلقائي حسب RSI بدون شارتات ثقيلة</div></div>`;
+  big.innerHTML=`<div class="glass rounded-2xl p-6 text-center border-dashed"><div class="text-[14px]">🔴 يبحث عن صفقة مباشرة...</div><div class="text-[11px] text-gray-500 mt-1">مارجن $1 | يفتح LONG/SHORT حسب RSI | هدف $1+ مفتوح</div></div>`;
  }
  const sc=await fetch('/api/scan').then(r=>r.json());
  document.getElementById('sigs').innerHTML=sc.signals.map(s=>`<div class="bg-black/30 rounded-xl p-3 flex justify-between items-center"><div class="flex gap-2 items-center"><span class="font-black text-[13px]">${s.symbol}</span><span class="font-mono text-[12px]">${s.price.toFixed(4)}</span><span class="px-2 py-0.5 rounded-full text-[10px] font-black ${s.direction=='long'?'bg-green-500 text-black':'bg-red-500 text-white'}">${s.direction.toUpperCase()}</span><span class="text-[10px] text-gray-400">RSI ${s.rsi}</span></div><span class="text-[10px] text-gray-500">Score ${s.score}</span></div>`).join('');
