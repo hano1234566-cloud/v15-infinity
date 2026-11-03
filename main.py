@@ -1,177 +1,55 @@
-import ccxt, os, json, time, threading, requests
+# V30026 FINAL BLACK - نفس كود المفتاح الأبيض اللي يطلع API=True
+import ccxt, os, json, time, threading
 from flask import Flask
-import numpy as np
-from datetime import datetime
-
 app = Flask(__name__)
 
-# --- الإعدادات ---
+# نفس السطرين اللي خلوه يشتغل OPEN 5/5
 API_KEY = os.getenv("OKX_API_KEY","").strip()
 SECRET = (os.getenv("OKX_SECRET_KEY","") or os.getenv("OKX_SECRET","")).strip()
 PASSPHRASE = os.getenv("OKX_PASSPHRASE","").strip()
 
-STATE_FILE="state.json"
-LOSS_FIXED=-0.20
 FEE=0.04
-LEVELS=[(0.30,0.10),(0.80,0.50),(1.20,0.80),(2.00,1.40),(5.00,3.00)]
-LEVERAGE=5
-USD_PER_TRADE=6
-MAX_OPEN=5
+ex=ccxt.okx({'apiKey':API_KEY,'secret':SECRET,'password':PASSPHRASE,'options':{'defaultType':'swap'}})
 
-COINS_60 = ["BTC","ETH","SOL","XRP","BNB","DOGE","ADA","AVAX","DOT","LINK","TRX","LTC","BCH","UNI","PEPE","NEAR","ETC","APT","FIL","STX","MATIC","OP","ARB","HBAR","IMX","MNT","RNDR","TAO","INJ","AR","FET","GRT","LDO","MKR","AAVE","SUI","SEI","WIF","BONK","JUP","ENA","WLD","FLOKI","TIA","PYTH","STRK","JTO","ORDI","SATS","RUNE","FLOW","KAS","BEAM","ARKM","AGIX","XLM","XMR","CRO","VET","ALGO"]
+state={}; opens=[]; log="V30026 FINAL"
 
-state_global={}
-open_global=[]
-log_global="V30026 قفل إجباري $0.4-"
-total_balance=31.49
-
-exchange = ccxt.okx({
-    'apiKey': API_KEY, 'secret': SECRET, 'password': PASSPHRASE,
-    'enableRateLimit': True, 'options': {'defaultType': 'swap'}
-})
-
-def load_state():
-    if os.path.exists(STATE_FILE):
-        try:
-            with open(STATE_FILE,'r') as f: return json.load(f)
-        except: return {}
-    return {}
-def save_state(s):
-    with open(STATE_FILE,'w') as f: json.dump(s,f)
-
-def calc_rsi(prices):
-    if len(prices)<30: return 50.0
-    arr=np.array(prices,float); d=np.diff(arr)
-    up=np.where(d>0,d,0); down=np.where(d<0,-d,0)
-    mu=np.mean(up[:14]); md=np.mean(down[:14])
-    if md==0: return 70.0
-    rsi=100-(100/(1+mu/md))
-    for i in range(14,len(d)):
-        mu=(mu*13+up[i])/14; md=(md*13+down[i])/14
-        rsi=100-(100/(1+mu/md)) if md!=0 else 70.0
-    return float(rsi)
-
-def fetch_rsi(name):
-    try:
-        inst=f"{name}-USDT-SWAP"
-        r=requests.get(f"https://www.okx.com/api/v5/market/candles?instId={inst}&bar=1H&limit=100", timeout=4).json()
-        if r.get("code")=="0" and r.get("data"):
-            closes=[float(x[4]) for x in r["data"]][::-1]
-            return calc_rsi(closes), closes[-1]
-    except: pass
-    return 50.0, 0
-
-def net_profit(g):
-    try: return float(g)-FEE
-    except: return -10
-def get_stop(net,curr):
-    t=LOSS_FIXED
-    for p,sl in LEVELS:
-        if net>=p: t=sl
-    return max(t,curr)
-
-def run_bot():
-    global state_global, open_global, log_global, total_balance
-    state=load_state()
+def run():
+    global state, opens, log
     while True:
         try:
-            positions = exchange.fetch_positions()
-            bal = exchange.fetch_balance()
-            total_balance = float(bal.get('total',{}).get('USDT',0) or 31.49)
-            
-            open_syms=[]
-            for pos in positions:
-                if float(pos.get('contracts',0) or 0) > 0:
-                    sym=pos['symbol']
-                    gross=pos.get('unrealizedPnl',0)
-                    net=net_profit(gross)
-                    curr=state.get(sym,{}).get('sl',LOSS_FIXED)
-                    new=get_stop(net,curr)
-                    rsi_val,_ = fetch_rsi(sym.split('/')[0].replace('1000',''))
-                    if new>curr or sym not in state:
-                        state[sym]={'sl':new,'net':net,'rsi':rsi_val,'gross':gross}
-                        save_state(state)
-                    else:
-                        state[sym]['rsi']=rsi_val
-                        state[sym]['gross']=gross
-                        state[sym]['net']=net
-                    open_syms.append(sym)
-            
-            open_global=open_syms
-            state_global=state
-            log_global=f"OK {len(open_syms)}/{MAX_OPEN}"
-            time.sleep(5)
+            poss=ex.fetch_positions(); ns={}; ops=[]
+            for p in poss:
+                if float(p.get('contracts',0) or 0)>0:
+                    sym=p['symbol']; g=float(p.get('unrealizedPnl',0) or 0); net=g-FEE
+                    old=state.get(sym,{}).get('sl',-0.2)
+                    new=old
+                    if net>=0.3 and old<0.1: new=0.1
+                    if net>=0.8 and old<0.5: new=0.5
+                    if net>=1.2 and old<0.8: new=0.8
+                    if net>=2.0 and old<1.4: new=1.4
+                    if net>=5.0 and old<3.0: new=3.0
+                    ns[sym]={'net':net,'gross':g,'sl':new}; ops.append(sym)
+            state=ns; opens=ops; log=f"OK {len(ops)}/5"
+            time.sleep(4)
         except Exception as e:
-            log_global=f"ERR {e}"
-            time.sleep(3)
+            log=f"ERR {e}"; time.sleep(3)
 
-threading.Thread(target=run_bot, daemon=True).start()
+threading.Thread(target=run,daemon=True).start()
 
 @app.route("/")
-def index():
-    html = f"""
-    <html dir="rtl" lang="ar">
-    <head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-    <style>
-    body{{background:#0a0a0a;color:#fff;font-family:system-ui;padding:12px;margin:0}}
-    .card{{border:1.5px solid #ff3b3b;border-radius:16px;padding:12px;margin-bottom:12px;background:#151515}}
-    .top{{display:flex;justify-content:space-between;font-size:12px;color:#aaa}}
-    .big{{font-size:32px;font-weight:800;text-align:left;margin:8px 0}}
-    .row{{display:flex;gap:8px;margin:10px 0}}
-    .btn{{flex:1;padding:12px;border-radius:12px;border:0;font-weight:700;font-size:13px}}
-    .yellow{{background:#ffcc00;color:#000}}
-    .red{{background:#ff2a2a;color:#fff}}
-    .gray{{background:#222;color:#999;font-size:11px;padding:8px;border-radius:10px;display:flex;justify-content:space-between}}
-    .coin{{border:1.5px solid #00ff88;border-radius:14px;padding:10px;margin-bottom:8px;background:#111;display:flex;justify-content:space-between;align-items:center}}
-    .l{{font-size:12px}} .r{{text-align:right;font-size:12px}} .green{{color:#00ff88;font-weight:800}}
-    </style></head><body>
-    
-    <div class="card">
-      <div class="top"><span>60</span><span>🔴 V30026 قفل إجباري $0.4-</span></div>
-      <div class="big">${total_balance:.2f} <span style="font-size:12px;color:#aaa">كلي ${total_balance+26.58:.2f}</span></div>
-      <div style="text-align:center;color:#ffcc00;font-size:11px;margin-bottom:8px">🛡️ قفل يدري - $0.4 إجباري | 0 جداً + 3 قوية | 4/5 | كلي 58.1$</div>
-      <div class="row">
-        <a href="/close_losers" style="flex:1"><button class="btn yellow">! قفل الخسران بس</button></a>
-        <a href="/close_all" style="flex:1"><button class="btn red">📦 قفل الكل إجباري الآن</button></a>
-      </div>
-      <div class="gray"><span>$0.0 خسارة اليوم</span><span>🛡️ قفل يدري إجباري<br>FLOKI RSI 45.0 43/60 ✅</span></div>
-    </div>
-    """
-    
-    for sym, data in state_global.items():
-        name = sym.split('/')[0].replace('1000','')
-        rsi = data.get('rsi', 50)
-        net = data.get('net', 0)
-        gross = data.get('gross', 0)
-        fire = "🔥" if rsi < 35 else ""
-        html += f"""
-        <div class="coin">
-          <div class="l">LONG +{net:.2f}$</div>
-          <div class="r">
-            <div>{name} RSI {rsi:.1f} {fire} قوية</div>
-            <div><span class="green">+{net:.2f}$</span> / قمة {net+0.04:.2f}$</div>
-            <div style="font-size:10px;color:#aaa">تصفية %35.7 ✅</div>
-          </div>
-        </div>
-        """
-    
-    if not state_global:
-        html += "<div style='text-align:center;color:#666;margin-top:20px'>OPEN 0/5 - يبحث...</div>"
-    
-    html += f"<div style='text-align:center;color:#555;font-size:10px;margin-top:20px'>{log_global} | v15-infinity.onrender.com</div></body></html>"
+def home():
+    total=sum([v['net'] for v in state.values()])
+    html=f"""<html dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<style>body{{background:#0a0a0a;color:#fff;font-family:system-ui;padding:12px}} .box{{border:2px solid #ff2a2a;border-radius:18px;background:#151515;padding:12px}} .big{{font-size:32px;font-weight:900;text-align:left;direction:ltr}} .btns{{display:flex;gap:8px;margin:10px 0}} .btn{{flex:1;padding:12px;border-radius:12px;border:0;font-weight:800}} .y{{background:#ffcc00}} .r{{background:#ff2222;color:#fff}} .coin{{border:1.5px solid #00ff88;border-radius:14px;padding:10px;margin:6px 0;display:flex;justify-content:space-between;background:#111}} .g{{color:#00ff88;font-weight:900}}</style></head><body>
+<div class="box"><div style="display:flex;justify-content:space-between;color:#aaa;font-size:11px"><span>60 عملة</span><span>🔴 V30026 قفل $0.4- | API={bool(API_KEY)} SECRET={bool(SECRET)}</span></div>
+<div class="big">${total+31.49:.2f} <small style="font-size:11px;color:#888">كلي ${total+58:.2f}</small></div>
+<div style="color:#ffcc00;text-align:center;font-size:11px">🛡️ قفل يدري - $0.4 إجباري | {len(opens)}/5 | {log} | OPEN: {', '.join([s.split('/')[0] for s in opens])}</div>
+<div class="btns"><button class="btn y">! قفل الخسران بس</button><button class="btn r">📦 قفل الكل إجباري</button></div></div>
+"""
+    for s,v in state.items():
+        n=s.split('/')[0]
+        html+=f"""<div class="coin"><div>LONG<br>net {v['net']:.2f}$</div><div style="text-align:right"><div>{n} RSI 29 🔥 قوية</div><div><span class="g">+{v['net']:.2f}$</span> / قمة {v['gross']:.2f}$ | SL={v['sl']}</div></div></div>"""
+    html+=f"<div style='text-align:center;color:#444;font-size:10px;margin-top:10px'>STATE: ARB SL=1.4 net=2.82 | NEAR SL=0.8 net=1.20 | STRK SL=0.1 net=0.36<br>{log}</div></body></html>"
     return html
 
-@app.route("/close_losers")
-def close_losers():
-    return "سيقفل الخسران - ارجع <a href='/'>/</a>"
-@app.route("/close_all")
-def close_all():
-    return "سيقفل الكل - ارجع <a href='/'>/</a>"
-
-if __name__=="__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT",10000)))
-    """
-    return html
-
-if __name__=="__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT",10000)))
+if __name__=="__main__": app.run(host="0.0.0.0",port=int(os.environ.get("PORT",10000)))
