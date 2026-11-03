@@ -1,5 +1,4 @@
 import ccxt, os, json, time, threading
-from datetime import datetime
 from flask import Flask
 
 STATE_FILE="state.json"
@@ -15,7 +14,27 @@ SPOT_RESERVE = ["AAVE/USDT:USDT","DOGE/USDT:USDT"]
 app = Flask(__name__)
 state_global={}
 open_global=[]
-log_global="V30026 starting"
+log_global="starting..."
+
+def get_key(name):
+    # 1- من Environment
+    v = os.getenv(name)
+    if v: return v.strip()
+    # 2- من Secret Files /etc/secrets
+    try:
+        for path in [f"/etc/secrets/{name}", f"/etc/secrets/{name.lower()}", f"./{name}"]:
+            if os.path.exists(path):
+                with open(path,'r') as f: return f.read().strip()
+    except: pass
+    # 3- من .env
+    try:
+        if os.path.exists(".env"):
+            with open(".env") as f:
+                for line in f:
+                    if name in line:
+                        return line.split("=")[1].strip().strip('"').strip("'")
+    except: pass
+    return None
 
 def load_state():
     if os.path.exists(STATE_FILE):
@@ -25,14 +44,6 @@ def load_state():
     return {}
 def save_state(s):
     with open(STATE_FILE,'w') as f: json.dump(s,f)
-
-exchange = ccxt.okx({
-    'apiKey': os.getenv('OKX_API_KEY'),
-    'secret': os.getenv('OKX_SECRET'),
-    'password': os.getenv('OKX_PASSPHRASE'),
-    'enableRateLimit': True,
-    'options': {'defaultType': 'swap'}
-})
 
 def net_profit(g):
     try: return float(g)-FEE
@@ -46,6 +57,22 @@ def get_stop(net,curr):
 def run_bot():
     global state_global, open_global, log_global
     state=load_state()
+    k = get_key('OKX_API_KEY')
+    s = get_key('OKX_SECRET')
+    p = get_key('OKX_PASSPHRASE')
+    if not k or not s or not p:
+        # جرب اسماء ثانية
+        k = k or get_key('OKX_AP') or get_key('FUTURE_API_KEY')
+        s = s or get_key('OKX_SE')
+        p = p or get_key('OKX_PA')
+    
+    if not k or not s or not p:
+        log_global=f"MISSING STILL k={bool(k)} s={bool(s)} p={bool(p)}"
+        return
+
+    exchange = ccxt.okx({'apiKey':k,'secret':s,'password':p,'enableRateLimit':True,'options':{'defaultType':'swap'}})
+    log_global="CONNECTED TO OKX OK"
+    
     while True:
         try:
             positions = exchange.fetch_positions()
@@ -61,11 +88,10 @@ def run_bot():
                     if new>curr or sym not in state:
                         state[sym]={'sl':new,'net':net}
                         save_state(state)
-
             open_global=open_syms
             state_global=state
-            log_global=f"OK {len(open_syms)}/5 at {datetime.now().strftime('%H:%M:%S')}"
-
+            log_global=f"OK {len(open_syms)}/5"
+            
             need = MAX_OPEN - len(open_syms)
             if need > 0:
                 for sym in COINS_60:
@@ -76,10 +102,8 @@ def run_bot():
                             exchange.set_leverage(LEVERAGE, sym)
                             exchange.create_market_order(sym,'buy',amt)
                             need-=1
-                            time.sleep(1.2)
-                        except Exception as e:
-                            log_global=f"FAIL {sym} {e}"
-                            time.sleep(0.5)
+                            time.sleep(1)
+                        except: time.sleep(0.5)
             time.sleep(5)
         except Exception as e:
             log_global=f"ERR {e}"
@@ -87,9 +111,9 @@ def run_bot():
 
 @app.route("/")
 def index():
-    opens="<br>".join(open_global) or "0 - سيفتح الآن"
-    states="<br>".join([f"{k}: SL={v['sl']} net={v.get('net',0):.2f}" for k,v in state_global.items()])
-    return f"V30026 CONTINUOUS (الأصلي)<br><br>OPEN {len(open_global)}/{MAX_OPEN}:<br>{opens}<br><br>STATE:<br>{states}<br><br>LOG: {log_global}<br><br>SPOT محفوظ AAVE/DOGE"
+    opens="<br>".join(open_global) or "جاري الاتصال..."
+    states="<br>".join([f"{k}: SL={v['sl']}" for k,v in state_global.items()])
+    return f"V30028 FINAL<br><br>OPEN {len(open_global)}/{MAX_OPEN}:<br>{opens}<br><br>STATE:<br>{states}<br><br>LOG: {log_global}<br><br>SPOT AAVE/DOGE محفوظ"
 
 threading.Thread(target=run_bot, daemon=True).start()
 if __name__=="__main__":
