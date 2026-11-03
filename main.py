@@ -1,5 +1,5 @@
 import os, time, threading, ccxt, json, requests
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 import numpy as np
 from datetime import datetime
 
@@ -8,7 +8,7 @@ SECRET = (os.getenv("OKX_SECRET_KEY","") or os.getenv("OKX_SECRET","")).strip()
 PASSPHRASE = os.getenv("OKX_PASSPHRASE","").strip()
 
 BAL = 0.0
-LAST = "V30025 - يقفل الخسران بدري"
+LAST = "V30026 - زر قفل بدري إجباري"
 SCAN_LOG = "🚀 يبدأ"
 SCAN_CURRENT = "BTC 1/60"
 ALL_RSI = []
@@ -16,12 +16,10 @@ SCAN_IDX = 0
 FEE = 0.04
 BASE_MARGIN = 5.0
 LEV = 10
-FILE = "/tmp/state_v30025.json"
+FILE = "/tmp/state_v30026.json"
 
 COINS_60 = ["BTC","ETH","SOL","XRP","BNB","DOGE","ADA","AVAX","DOT","LINK","TRX","LTC","BCH","UNI","PEPE","NEAR","ETC","APT","FIL","STX","MATIC","OP","ARB","HBAR","IMX","MNT","RNDR","TAO","INJ","AR","FET","GRT","LDO","MKR","AAVE","SUI","SEI","WIF","BONK","JUP","ENA","WLD","FLOKI","TIA","PYTH","STRK","JTO","ORDI","SATS","RUNE","FLOW","KAS","BEAM","ARKM","AGIX","XLM","XMR","CRO","VET","ALGO"]
-
 CONTRACT_SIZE = {"BTC":0.01,"ETH":0.1,"SOL":1,"XRP":100,"BNB":0.1,"DOGE":1000,"ADA":100,"AVAX":1,"DOT":10,"LINK":10,"TRX":1000,"LTC":0.1,"BCH":0.1,"UNI":10,"PEPE":10000000,"NEAR":10,"ETC":1,"APT":10,"FIL":1,"STX":100,"MATIC":100,"OP":10,"ARB":10,"HBAR":1000,"IMX":10,"MNT":10,"RNDR":10,"TAO":0.1,"INJ":1,"AR":1,"FET":100,"GRT":1000,"LDO":10,"MKR":0.01,"AAVE":0.1,"SUI":10,"SEI":100,"WIF":10,"BONK":10000000,"JUP":10,"ENA":100,"WLD":10,"FLOKI":10000000,"TIA":10,"PYTH":100,"STRK":10,"JTO":10,"ORDI":1,"SATS":10000000,"RUNE":10,"FLOW":10,"KAS":1000,"BEAM":1000,"ARKM":10,"AGIX":100,"XLM":1000,"XMR":0.1,"CRO":1000,"VET":10000,"ALGO":100}
-
 STATE = {"open":{},"closed":[],"blacklist":{},"daily":0,"avail":0,"total":0,"wins":0,"losses":0,"fees":0,"trades":0,"consec_losses":0,"next_margin":BASE_MARGIN,"daily_losses":0,"daily_loss_amount":0.0}
 try:
     if os.path.exists(FILE):
@@ -133,11 +131,42 @@ def close_any(sym):
         except: continue
     return None
 
+def force_close_all():
+    closed=[]
+    try:
+        ex=get_ex_auth()
+        positions=ex.fetch_positions()
+        for p in positions:
+            if float(p.get('contracts',0) or 0)>0:
+                sym=p['symbol']
+                if close_any(sym):
+                    closed.append(sym)
+                    time.sleep(0.5)
+    except Exception as e:
+        return [str(e)]
+    return closed
+
 def hunter():
     global LAST
     get_bal()
     try: get_ex_auth().load_markets()
     except: pass
+    
+    # ⭐ أول ما يشتغل - يقفل الخسرانة فوراً
+    try:
+        ex=get_ex_auth()
+        for p in ex.fetch_positions():
+            if float(p.get('contracts',0) or 0)>0:
+                gross=float(p.get('unrealizedPnl',0) or 0)
+                name=p['symbol'].replace('/USDT:USDT','')
+                # إذا خسرانة أكثر من -0.3 أو RSI 50-
+                if gross<=-0.3:
+                    if close_any(p['symbol']):
+                        LAST=f"🧹 قفل إجباري بدري {name} {gross:.2f}$ - وفر خسارة"
+                        STATE["open"].pop(p['symbol'],None)
+                        time.sleep(0.5)
+    except: pass
+
     while True:
         try:
             scan_chunk()
@@ -156,16 +185,6 @@ def hunter():
                         total_gross+=gross
                         entry=float(p.get('entryPrice',0) or 0); mark=float(p.get('markPrice',0) or entry)
                         liq=float(p.get('liquidationPrice',0) or 0); side=p.get('side','long')
-                        info=STATE["open"].get(sym,{})
-                        
-                        # ⭐ يقفل RSI 0 فوراً - هذا اللي عندك AVAX و BNB
-                        if info.get("rsi",50)==0 or info.get("rsi",50)<=1:
-                            if close_any(sym):
-                                STATE["open"].pop(sym,None)
-                                LAST=f"🧹 قفل بدري {name} RSI 0 خربانة - وفر خسارة"
-                                save()
-                            continue
-                        
                         if sym not in STATE["open"]:
                             STATE["open"][sym]={"name":name,"dir":side,"entry":entry,"best":net,"best_net":net,"rsi":50,"start_time":datetime.now().timestamp()}
                         best=STATE["open"][sym].get("best_net",net)
@@ -174,22 +193,14 @@ def hunter():
                         target=3.0 if score>=20 else 2.0 if score>=15 else 1.2
                         
                         should=False; reason=""
-                        # ⭐ يقفل بدري إذا بيخسرنا
-                        if net<=-0.5:  # كان -0.9 الآن -0.5 بدري
-                            should=True; reason=f"قفل بدري خسارة {net:.2f}$ قبل تكبر 🛡️"
-                        elif net<=-0.3 and best<0:  # إذا ما ربح أبداً ونزل -0.3
-                            # شيك RSI الحالي - إذا عكس علينا
-                            current_rsi_info=[x for x in ALL_RSI if x["symbol"]==name]
-                            if current_rsi_info:
-                                curr_rsi=current_rsi_info[0]["rsi"]
-                                # إذا دخلنا LONG و RSI صار فوق 60 يعني عكس
-                                if side=='long' and curr_rsi>60:
-                                    should=True; reason=f"قفل بدري RSI عكس {curr_rsi} ضدنا"
-                                elif side=='short' and curr_rsi<40:
-                                    should=True; reason=f"قفل بدري RSI عكس {curr_rsi} ضدنا"
+                        # ⭐ قفل بدري -0.4$ الآن أسرع
+                        if net<=-0.4:
+                            should=True; reason=f"قفل بدري -0.4$ إجباري 🛡️ {net:.2f}"
+                        elif net<=-0.25 and best<=0:
+                            should=True; reason=f"قفل بدري ما ربح {net:.2f}"
                         elif liq>0 and entry>0:
                             dist=(mark-liq)/entry*100 if side=='long' else (liq-mark)/entry*100
-                            if dist<12: should=True; reason=f"تصفية {dist:.1f}% قريب 🛡️"
+                            if dist<12: should=True; reason=f"تصفية {dist:.1f}%"
                         else:
                             if best>=0.4 and net<=0.05: should=True; reason=f"حماية رأس مال"
                             elif best>=0.6 and net<=best-0.5: should=True; reason=f"تريلينق +${best:.2f}→${net:.2f}"
@@ -204,8 +215,8 @@ def hunter():
                             else: STATE["losses"]+=1; STATE["consec_losses"]+=1; STATE["daily_losses"]+=1
                             save()
                 
-                if total_gross<=-2.0 and len([p for p in positions if float(p.get('contracts',0) or 0)>0])>=2:
-                    LAST=f"🛡️ قفل بدري إجمالي {total_gross:.1f}$ - نسكر قبل الجحفلة"
+                if total_gross<=-1.5 and len([p for p in positions if float(p.get('contracts',0) or 0)>0])>=2:
+                    LAST=f"🛡️ قفل بدري إجمالي {total_gross:.1f}$"
                     for p in positions:
                         if float(p.get('contracts',0) or 0)>0:
                             close_any(p['symbol']); time.sleep(0.3)
@@ -217,17 +228,13 @@ def hunter():
             try: live=len([p for p in get_ex_auth().fetch_positions() if float(p.get('contracts',0) or 0)>0])
             except: live=len(STATE["open"])
             open_names=[v["name"] for v in STATE["open"].values()]
-
             very_strong_count=len([x for x in ALL_RSI if (x["rsi"]<=25 or x["rsi"]>=75) and x["rsi"]>1])
             strong_count=len([x for x in ALL_RSI if (x["rsi"]<=32 or x["rsi"]>=68) and x["rsi"]>1])
-            
             total_eq=STATE["total"]
             max_positions=6 if very_strong_count>=3 and total_eq>=25 else 5 if very_strong_count>=1 and total_eq>=20 else 4 if strong_count>=3 and total_eq>=15 else 2
-            
             max_margin_allowed=total_eq*0.5
             remaining_margin=max_margin_allowed - live*BASE_MARGIN
-            
-            LAST=f"🛡️ قفل بدري -0.5$ | {very_strong_count} جداً + {strong_count} قوية | {live}/{max_positions} | كلي ${total_eq:.1f} | خسارة اليوم ${STATE['daily_loss_amount']:.1f}"
+            LAST=f"🛡️ قفل بدري -0.4$ إجباري | {very_strong_count} جداً + {strong_count} قوية | {live}/{max_positions} | كلي ${total_eq:.1f}"
 
             if live<max_positions and remaining_margin>=4 and get_bal()>=3 and len(ALL_RSI)>=10:
                 strong=[]; medium=[]
@@ -241,24 +248,22 @@ def hunter():
                     elif r>=68: strong.append({**x,"direction":"short","score":15,"type":"قوية 🔥"})
                     elif r<=40: medium.append({**x,"direction":"long","score":8,"type":"متوسطة ⚡"})
                     elif r>=60: medium.append({**x,"direction":"short","score":8,"type":"متوسطة ⚡"})
-                
                 candidates=sorted(strong+medium, key=lambda x: abs(x["rsi"]-50), reverse=True)
-                
                 for to_open in candidates:
                     if live>=max_positions or remaining_margin<4: break
                     try:
                         ex=get_ex_auth()
                         price=to_open["price"]; sym_name=to_open["symbol"]
                         contract_size=CONTRACT_SIZE.get(sym_name, 1)
-                        contracts=(BASE_MARGIN*LEV)/(price*contract_size)
+                        contracts=(BASE_MARGIN*10)/(price*contract_size)
                         contracts=max(contracts, 1)
                         if sym_name in ["BTC","MKR"]: contracts=round(contracts,3)
                         elif sym_name in ["ETH","LTC","BCH","XMR","TAO"]: contracts=round(contracts,2)
                         else: contracts=int(contracts) if contracts>=1 else round(contracts,1)
                         if contracts<1: contracts=1
-                        real_margin=(contracts*contract_size*price)/LEV
+                        real_margin=(contracts*contract_size*price)/10
                         if real_margin>get_bal()+0.5 or real_margin>remaining_margin: continue
-                        try: ex.set_leverage(LEV,to_open["full"])
+                        try: ex.set_leverage(10,to_open["full"])
                         except: pass
                         is_long=to_open["direction"]=="long"
                         side="buy" if is_long else "sell"
@@ -286,8 +291,16 @@ def hunter():
 def index(): return HTML
 @app.route("/health", methods=["GET","POST"])
 def health(): return "OK", 200
+@app.route("/api/force_close", methods=["GET","POST"])
+def force_close():
+    closed=force_close_all()
+    STATE["open"]={}
+    save()
+    return jsonify({"closed":closed,"msg":f"قفل {len(closed)} صفقة"})
+
 @app.route("/api/status", methods=["GET","POST"])
-def status(): return jsonify({"bal":get_bal(),"avail":STATE["avail"],"total":STATE["total"],"count":len(STATE["open"]),"last":LAST,"scan_log":SCAN_LOG,"scan_current":SCAN_CURRENT,"scan_count":60,"all_rsi":ALL_RSI,"scan_idx":SCAN_IDX,"daily":STATE["daily"],"wins":STATE["wins"],"losses":STATE["losses"],"trades":STATE["trades"],"fees":STATE["fees"],"next_margin":STATE["next_margin"],"daily_losses":STATE["daily_losses"],"daily_loss_amount":STATE["daily_loss_amount"],"blacklist":list(STATE["blacklist"].keys())})
+def status(): return jsonify({"bal":get_bal(),"avail":STATE["avail"],"total":STATE["total"],"count":len(STATE["open"]),"last":LAST,"scan_log":SCAN_LOG,"scan_current":SCAN_CURRENT,"scan_count":60,"all_rsi":ALL_RSI,"scan_idx":SCAN_IDX,"daily":STATE["daily"],"wins":STATE["wins"],"losses":STATE["losses"],"trades":STATE["trades"],"fees":STATE["fees"],"next_margin":STATE["next_margin"],"daily_losses":STATE["daily_losses"],"daily_loss_amount":STATE["daily_loss_amount"]})
+
 @app.route("/api/pnl", methods=["GET","POST"])
 def pnl():
     live=[]
@@ -304,4 +317,9 @@ def pnl():
     except: pass
     return jsonify({"bal":get_bal(),"total":STATE["total"],"live":live,"closed":STATE["closed"]})
 
-HTML = """<!DOCTYPE html><html lang=ar dir=rtl><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>V30025 قفل بدري</title><script src="https://cdn.tailwindcss.com"></script><style>body{background:#000;color:#fff}.card{background:#111214;border-radius:18px}.glass{background:#111c2f;border:1px solid #1e355a}.live-dot{animation:pulse 1s infinite}@keyframes pulse{0%,100%{opacity:1}50%{opacity:.5}}</style></head><body class="max-w-[480px] mx-auto p-3"><div class="bg-[#111214] rounded-[22px] p-4 border border-red-500/30"><div class="flex justify-between text-[11px] text-gray-400"><span class="flex gap-1 items-center"><span class="w-2 h-2 bg-red-500 rounded-full live-dot"></span>V30025 قفل بدري -0.5$ 🛡️</span><span>60</span></div><div class="flex gap-2 items-baseline mt-2"><div id="bal" class="text-[30px] font-black">$0</div><div id="total" class="text-[11px] text-gray-500"></div></div><div id="last" class="text-[10px] font-bold mt-2 text-yellow-300 break-all leading-5"></div><div class="mt-2 bg-red-500/10 rounded-xl p-2 border border-red-500/30"><div class="flex justify-between text-[10px]"><span class="text-red-400 font-bold">🛡️ قفل بدري إذا بيخسرنا</span><span id="riskInfo" class="text-white font-mono">-</span></div><div id="scanLog" class="text-[11px] text-white mt-1 font-mono">بانتظار...</div></div><div class="flex gap-2 mt-3 flex-wrap"><span id="cnt" class="bg-white/10 px-3 py-1 rounded-full text-[10px]"></span><span id="strongCount" class="bg-green-500 text-black px-3 py-1 rounded-full text-[10px] font-black"></span><span id="maxPos" class="bg-yellow-400 text-black px-3 py-1 rounded-full text-[10px] font-black"></span></div></div><div id="liveBig" class="my-3"></div><div class="glass rounded-2xl p-3 border-2 border-red-400/50"><div class="text-[11px] font-black">🛡️ قوانين قفل بدري</div><div class="text-[10px] text-gray-300 mt-1 leading-4">• RSI 0 يقفل فوراً 🧹<br>• خسارة -0.5$ يقفل بدري (كان -0.9$)<br>• RSI عكس علينا + خ
+HTML = """<!DOCTYPE html><html lang=ar dir=rtl><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>V30026 قفل إجباري</title><script src="https://cdn.tailwindcss.com"></script><style>body{background:#000;color:#fff}.card{background:#111214;border-radius:18px}.glass{background:#111c2f;border:1px solid #1e355a}.live-dot{animation:pulse 1s infinite}@keyframes pulse{0%,100%{opacity:1}50%{opacity:.5}}</style></head><body class="max-w-[480px] mx-auto p-3"><div class="bg-[#111214] rounded-[22px] p-4 border border-red-500"><div class="flex justify-between text-[11px] text-gray-400"><span class="flex gap-1 items-center"><span class="w-2 h-2 bg-red-500 rounded-full live-dot"></span>V30026 قفل إجباري -0.4$</span><span>60</span></div><div class="flex gap-2 items-baseline mt-2"><div id="bal" class="text-[30px] font-black">$0</div><div id="total" class="text-[11px] text-gray-500"></div></div><div id="last" class="text-[10px] font-bold mt-2 text-yellow-300 break-all leading-5"></div><div class="mt-3 flex gap-2"><button onclick="forceClose()" class="flex-1 bg-red-600 hover:bg-red-700 text-white font-black py-3 rounded-xl text-[13px]">🛑 قفل الكل إجباري الآن</button><button onclick="closeLoss()" class="flex-1 bg-yellow-500 hover:bg-yellow-600 text-black font-black py-3 rounded-xl text-[13px]">⚠️ قفل الخسران بس</button></div><div id="forceResult" class="text-[11px] text-green-400 mt-2 font-bold"></div><div class="mt-2 bg-red-500/10 rounded-xl p-2 border border-red-500/30"><div class="flex justify-between text-[10px]"><span class="text-red-400 font-bold">🛡️ قفل بدري إجباري</span><span id="riskInfo" class="text-white font-mono">-</span></div><div id="scanLog" class="text-[11px] text-white mt-1 font-mono">بانتظار...</div></div></div><div id="liveBig" class="my-3"></div><script>async function load(){const s=await fetch('/api/status').then(r=>r.json());document.getElementById('bal').textContent=`$${s.bal.toFixed(2)}`;document.getElementById('total').textContent=`/ $${s.total.toFixed(2)} كلي`;document.getElementById('last').textContent=s.last;document.getElementById('scanLog').textContent=s.scan_log;document.getElementById('riskInfo').textContent=`خسارة اليوم ${s.daily_loss_amount.toFixed(1)}$`;const d=await fetch('/api/pnl').then(r=>r.json());document.getElementById('liveBig').innerHTML=d.live.length?d.live.map(x=>`<div class="card p-3 border-2 ${x.gross<0?'border-red-500':'border-green-500'} mb-2"><div class="flex justify-between text-[11px]"><span>${x.type} ${x.sym} RSI ${x.rsi}</span><span>${x.side.toUpperCase()} ${x.gross>=0?'+':''}${x.gross.toFixed(2)}$</span></div><div class="text-[18px] font-black ${x.gross<0?'text-red-500':'text-green-400'}">${x.gross>=0?'+':''}${x.gross.toFixed(2)} <span class="text-[10px] text-gray-400">/ قمة $${x.best.toFixed(2)}</span></div><div class="text-[9px] ${x.gross<=-0.3?'text-red-400 font-black':'text-gray-400'}">${x.gross<=-0.4?'🛑 بيقفل الآن -0.4$ إجباري':x.gross<=-0.25?'⚠️ بيقفل بدري قريب':'✅'} تصفية ${x.dist.toFixed(1)}%</div></div>`).join(''):`<div class="glass rounded-[20px] p-4 text-center text-[11px] text-gray-400">لا يوجد صفقات مفتوحة ✅<br>جاهز للقوية جداً</div>`;}async function forceClose(){document.getElementById('forceResult').textContent='⏳ يقفل الكل...';const r=await fetch('/api/force_close',{method:'POST'}).then(x=>x.json());document.getElementById('forceResult').textContent=`✅ ${r.msg}: ${r.closed.join(', ')}`;setTimeout(load,1000);}async function closeLoss(){document.getElementById('forceResult').textContent='⏳ يقفل الخسران...';const d=await fetch('/api/pnl').then(r=>r.json());for(const x of d.live){if(x.gross<=-0.2){await fetch('/api/force_close',{method:'POST'});}}document.getElementById('forceResult').textContent='✅ قفل الخسران';setTimeout(load,1000);}setInterval(load,1000);load();</script></body></html>
+"""
+
+threading.Thread(target=hunter,daemon=True).start()
+if __name__=="__main__":
+    app.run(host="0.0.0.0",port=int(os.getenv("PORT",10000)))
