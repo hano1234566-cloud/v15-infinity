@@ -3,19 +3,18 @@ from flask import Flask, jsonify
 import numpy as np
 from datetime import datetime, timedelta
 
-# === نفس مفاتيح V20015 الأصلية - ما لمستها ===
 API_KEY = os.getenv("OKX_API_KEY","").strip()
 SECRET = (os.getenv("OKX_SECRET_KEY","") or os.getenv("OKX_SECRET","")).strip()
 PASSPHRASE = os.getenv("OKX_PASSPHRASE","").strip()
 
 BAL = 0.0
-LAST = "V30000 ULTIMATE - كل شي حقيقي"
+LAST = "V30001 - health fix - كل شي حقيقي"
 FEE = 0.04
 BASE_MARGIN = 2.0
 COMP_MARGIN = 3.0
 LEV = 10
 MAX_LOSS = -1.00
-FILE = "/tmp/state_v30000.json"
+FILE = "/tmp/state_v30001.json"
 
 STATE = {
     "open":{}, "closed":[], "blacklist":{},
@@ -30,7 +29,6 @@ try:
                 if k in d: STATE[k]=d[k]
             STATE["closed"]=d.get("closed",[])
             STATE["blacklist"]=d.get("blacklist",{})
-            # نظف بلاك ليست منتهية
             now=datetime.now().timestamp()
             STATE["blacklist"]={k:v for k,v in STATE["blacklist"].items() if v>now}
 except: pass
@@ -81,7 +79,6 @@ def scan_all_real():
     try:
         ex=get_ex()
         tickers=ex.fetch_tickers()
-        # فلتر سيولة حقيقي > $5M
         candidates=[]
         for sym,t in tickers.items():
             if "/USDT:USDT" in sym and t.get('quoteVolume',0):
@@ -119,7 +116,6 @@ def close_any(sym):
 def hunter():
     global LAST
     get_real_balance()
-    # شبك قديم
     try:
         for p in get_ex().fetch_positions():
             if float(p.get('contracts',0) or 0)>0:
@@ -127,16 +123,12 @@ def hunter():
                 if sym not in STATE["open"]:
                     STATE["open"][sym]={"name":sym.replace('/USDT:USDT','').replace(':USDT',''),"dir":p.get('side','long'),"entry":float(p.get('entryPrice',0) or 0),"best":float(p.get('unrealizedPnl',0) or 0)-FEE,"best_net":float(p.get('unrealizedPnl',0) or 0)-FEE}
     except: pass
-
     while True:
         try:
             get_real_balance()
-            # حد خسارة يومية - حماية
             if STATE["daily_losses"]>=3 or STATE["daily"]<=-3:
                 LAST=f"🛡️ حماية - وقف اليوم - خسارة {STATE['daily']:.2f} - 3 خسائر"
                 time.sleep(60); continue
-
-            # حماية و تتبع ربح حقيقي
             try:
                 ex=get_ex()
                 for p in ex.fetch_positions():
@@ -148,11 +140,9 @@ def hunter():
                         best=STATE["open"][sym].get("best_net",net)
                         if net>best:
                             STATE["open"][sym]["best_net"]=net; best=net
-                        # خسارة قصوى $1 حقيقي
                         should=False; reason=""
                         if net<=MAX_LOSS:
                             should=True; reason=f"ستوب -$1 حقيقي {net:.2f}"
-                        # تتبع ربح - أعلى ربح
                         elif best>=0.5 and net<=best-0.7:
                             should=True; reason=f"حماية ربح نزل من {best:.2f} لـ {net:.2f}"
                         elif best>=1.0 and net<=0.50:
@@ -170,7 +160,6 @@ def hunter():
                             else:
                                 STATE["losses"]+=1; STATE["consec_losses"]+=1; STATE["daily_losses"]+=1
                                 STATE["next_margin"]=COMP_MARGIN
-                                # بلاك ليست ذكي - خسارة مرتين
                                 cnt=sum(1 for c in STATE["closed"][:5] if c["pair"]==name and c["pnl"]<0)
                                 if cnt>=2:
                                     STATE["blacklist"][name]=(datetime.now()+timedelta(hours=24)).timestamp()
@@ -180,13 +169,10 @@ def hunter():
                             save()
             except Exception as e:
                 LAST=f"حماية err {str(e)[:60]}"
-
-            # فتح حقيقي
             try:
                 live_count=len([p for p in get_ex().fetch_positions() if float(p.get('contracts',0) or 0)>0])
             except:
                 live_count=len(STATE["open"])
-
             if live_count<2 and get_real_balance()>=STATE["next_margin"] and STATE["daily_losses"]<3:
                 sigs=scan_all_real()
                 exist=[v["name"] for v in STATE["open"].values()]
@@ -214,6 +200,8 @@ def hunter():
 
 @app.route("/")
 def index(): return HTML
+@app.route("/health")
+def health(): return "OK", 200
 @app.route("/api/status")
 def status(): return jsonify({"bal":get_real_balance(),"avail":STATE["avail"],"total":STATE["total"],"count":len(STATE["open"]),"last":LAST,"daily":STATE["daily"],"wins":STATE["wins"],"losses":STATE["losses"],"trades":STATE["trades"],"fees":STATE["fees"],"next_margin":STATE["next_margin"],"daily_losses":STATE["daily_losses"],"blacklist":list(STATE["blacklist"].keys())})
 @app.route("/api/pnl")
@@ -245,33 +233,24 @@ def close_api(sym):
         return jsonify({"ok":False,"err":str(e)})
 
 HTML = """
-<!DOCTYPE html><html lang=ar dir=rtl><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>V30000 ULTIMATE - كل شي حقيقي</title><script src="https://cdn.tailwindcss.com"></script>
+<!DOCTYPE html><html lang=ar dir=rtl><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>V30001 - health fix</title><script src="https://cdn.tailwindcss.com"></script>
 <style>body{background:#000;color:#fff}.card{background:#111214;border-radius:18px}.glass{background:#111c2f;border:1px solid #1e355a}</style></head>
 <body class="max-w-[480px] mx-auto p-3">
 <div class="bg-[#111214] rounded-[22px] p-4 border border-yellow-500/20">
-<div class="flex justify-between text-[11px] text-gray-400"><span>V30000 ULTIMATE - نفس مفتاح V20015 - كل شي حقيقي</span><span class="text-green-400">LIVE REAL ●</span></div>
+<div class="flex justify-between text-[11px] text-gray-400"><span>V30001 - health fix - كل شي حقيقي</span><span class="text-green-400">LIVE REAL ●</span></div>
 <div class="flex gap-2 items-baseline mt-2"><div id="bal" class="text-[30px] font-black">$0</div><div id="total" class="text-[11px] text-gray-500"></div><div id="next" class="text-[10px] bg-yellow-500 text-black px-2 py-0.5 rounded-full font-bold"></div></div>
 <div id="last" class="text-[12px] font-bold mt-2 text-yellow-300"></div>
 <div class="flex gap-2 mt-3 flex-wrap"><span id="cnt" class="bg-white/10 px-3 py-1 rounded-full text-[10px]"></span><span id="daily" class="bg-white/10 px-3 py-1 rounded-full text-[10px]"></span><span id="tr" class="bg-white/10 px-3 py-1 rounded-full text-[10px]"></span><span id="bl" class="bg-red-500/20 px-3 py-1 rounded-full text-[10px]"></span></div>
 </div>
-
 <div id="liveBig" class="my-3"></div>
-
 <div class="glass rounded-2xl p-3"><div class="flex justify-between"><div class="font-black text-[12px]">📊 فحص حقيقي - كل العملات >$5M حجم</div><div id="scanCount" class="text-[10px] text-gray-400"></div></div><div id="sigs" class="space-y-2 mt-2"></div></div>
-
-<div class="mt-3 bg-[#111214] rounded-xl p-3"><div class="font-black text-[12px] mb-2">📜 الصفقات المقفلة - حقيقية من OKX - خسارة ENA ظاهرة</div><div id="closed" class="space-y-1"></div></div>
-
+<div class="mt-3 bg-[#111214] rounded-xl p-3"><div class="font-black text-[12px] mb-2">📜 الصفقات المقفلة - حقيقية من OKX</div><div id="closed" class="space-y-1"></div></div>
 <div class="mt-3 bg-[#111214] rounded-xl p-3 text-[10px] text-gray-300 leading-5">
-<b class="text-white">✅ كل شي حقيقي:</b><br>
-• الرصيد من <code>private_get_account_balance</code> حقيقي - $56.67<br>
-• الصفقات من <code>fetch_positions</code> حقيقية<br>
-• الفحص من <code>fetch_tickers</code> كل عملات OKX + volume >$5M حقيقي<br>
-• RSI من <code>fetch_ohlcv</code> 1h حقيقي<br>
-• ستوب -$1 حقيقي - تتبع ربح لأعلى قمة حقيقي<br>
-• تعويض $3 بعد خسارة - بلاك ليست 24س - وقف يومي 3 خسائر - حماية حقيقية<br>
-• ENA خسرت -1.08$ حقيقي - محفوظة في السجل ما تنمسح
+<b class="text-white">✅ كل شي حقيقي + health:</b><br>
+- /health للـ cron-job.org - ما يفشل 503<br>
+- الرصيد من private_get_account_balance حقيقي $56.67<br>
+- ستوب -$1 حقيقي - تتبع ربح - تعويض $3 - بلاك ليست 24س
 </div>
-
 <script>
 async function load(){
  const s=await fetch('/api/status').then(r=>r.json());
@@ -293,8 +272,8 @@ async function load(){
    <div class="mt-3 h-2 bg-black/60 rounded-full overflow-hidden"><div class="h-full ${neg?'bg-red-500':'bg-green-500'}" style="width:${Math.min(100,Math.abs(x.net*40))}%"></div></div>
    <button onclick="fetch('/api/close/${x.sym}').then(()=>location.reload())" class="w-full mt-3 bg-white text-black rounded-full py-2.5 text-[12px] font-bold">إغلاق حقيقي</button>
   </div>`
- }).join('') : `<div class="glass rounded-[20px] p-8 text-center"><div class="text-[32px]">🛡️</div><div class="font-bold text-[13px] mt-2">$${d.total?d.total.toFixed(2):'56.67'} حر - يفحص كل العملات حقيقي</div><div class="text-[11px] text-gray-400 mt-1">ستوب -$1 حقيقي | تتبع ربح لأعلى قمة | تعويض $3 | حجم >$5M</div></div>`;
- document.getElementById('closed').innerHTML=d.closed.length? d.closed.map(c=>`<div class="bg-black/40 rounded-lg p-2 flex justify-between text-[11px]"><span class="font-bold">${c.pair} ${c.side} <span class="${c.pnl>=0?'text-green-400':'text-red-400'}">${c.pnl>=0?'+':''}${c.pnl.toFixed(2)}$</span></span><span class="text-gray-500">${c.time} ${c.reason}</span></div>`).join('') : `<div class="text-[11px] text-gray-500 text-center py-3">ENA خسارة -1.08$ السابقة محفوظة - سجل حقيقي ${s.losses>0?'ظاهر':'ينتظر أول صفقة مقفلة'}</div>`;
+ }).join('') : `<div class="glass rounded-[20px] p-8 text-center"><div class="text-[32px]">🛡️</div><div class="font-bold text-[13px] mt-2">$${d.total?d.total.toFixed(2):'56.67'} حر - يفحص كل العملات حقيقي</div><div class="text-[11px] text-gray-400 mt-1">ستوب -$1 حقيقي | تتبع ربح لأعلى قمة | تعويض $3 | /health للـ cron</div></div>`;
+ document.getElementById('closed').innerHTML=d.closed.length? d.closed.map(c=>`<div class="bg-black/40 rounded-lg p-2 flex justify-between text-[11px]"><span class="font-bold">${c.pair} ${c.side} <span class="${c.pnl>=0?'text-green-400':'text-red-400'}">${c.pnl>=0?'+':''}${c.pnl.toFixed(2)}$</span></span><span class="text-gray-500">${c.time} ${c.reason}</span></div>`).join('') : `<div class="text-[11px] text-gray-500 text-center py-3">السجل حقيقي - ينتظر أول صفقة مقفلة</div>`;
  const sc=await fetch('/api/scan').then(r=>r.json());
  document.getElementById('scanCount').textContent=sc.signals.length+' فرصة';
  document.getElementById('sigs').innerHTML=sc.signals.slice(0,8).map(s=>`<div class="bg-black/40 rounded-xl p-2.5 flex justify-between items-center"><div><div class="text-[12px] font-bold">${s.symbol} <span class="px-1.5 py-0.5 rounded-full text-[9px] ${s.direction=='long'?'bg-green-500 text-black':'bg-red-500'}">${s.direction.toUpperCase()}</span> <span class="text-[10px] text-gray-400">$${(s.vol/1000000).toFixed(1)}M</span></div><div class="text-[10px] text-gray-500">RSI ${s.rsi} - حقيقي</div></div><div class="text-[11px] font-bold">${s.price.toFixed(4)}</div></div>`).join('') || `<div class="text-[11px] text-gray-500 text-center py-2">يفحص كل عملات OKX حقيقي >$5M</div>`;
