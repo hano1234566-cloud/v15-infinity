@@ -208,11 +208,12 @@ def position_size_coins(pos):
             entry = float(pos.get('entryPrice') or 0)
             if notional and entry:
                 return abs(notional) / abs(entry)
+            contracts = float(pos.get('contracts') or 0)
+            print('warning fallback to contracts', contracts)
+            return contracts
         except Exception:
-            pass
-        contracts = float(pos.get('contracts') or 0)
-    print('warning fallback to contracts', contracts)
-    return contracts
+            print('warning fallback to contracts', float(pos.get('contracts') or 0))
+            return float(pos.get('contracts') or 0)
                                            
 def profit_dollar_to_trigger_price(entry_price, desired_profit_dollar, position_size_coins, side='long'):
     # LONG: trigger = entry + desired_profit / size; SHORT: entry - desired_profit / size
