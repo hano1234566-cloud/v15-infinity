@@ -1,4 +1,4 @@
-# V30030 MERGED CORRECTED - NOT pushed to GitHub, NOT live yet
+# V30030 MERGED CORRECTED - UI version: same interface layout as screenshot, live OKX numbers
 # Correction 2026-11-04: OKX secret now uses V30026 working names:
 #   OKX_SECRET_KEY primary, OKX_SECRET fallback (merged draft used ONLY OKX_SECRET,
 #   so a key set as OKX_SECRET_KEY was ignored - that was a key-name bug, fixed here).
@@ -21,12 +21,70 @@
 
 import ccxt, os, json, time, threading
 from datetime import datetime
+# UI cache, updated by a background scanner, so the homepage is fast.
+# Numbers on the page are LIVE from OKX, never copied from a screenshot.
+UI_CACHE = {'total_net': 0.0, 'open_count': 0, 'scanned': 0, 'current': '', 'rsi_list': [], 'updated': ''}
+
+def calc_rsi(closes, period=14):
+    if len(closes) < period + 1:
+        return None
+    gains = []
+    losses = []
+    for i in range(1, period + 1):
+        d = closes[i] - closes[i-1]
+        gains.append(max(d, 0))
+        losses.append(max(-d, 0))
+    avg_gain = sum(gains) / period
+    avg_loss = sum(losses) / period
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return round(100 - (100 / (1 + rs)), 1)
+
+def ui_scanner():
+    idx = 0
+    while True:
+        try:
+            poss = exchange.fetch_positions()
+            total = 0.0
+            open_count = 0
+            for pos in poss:
+                if float(pos.get('contracts', 0) or 0) > 0:
+                    open_count += 1
+                    total += float(pos.get('unrealizedPnl', 0) or 0) - 0.04
+            # Scan 5 coins per cycle, rotating, like the old 5/60 UI.
+            batch = COINS_60[idx:idx+5]
+            if not batch:
+                idx = 0
+                batch = COINS_60[0:5]
+            rsi_list = []
+            for symbol in batch:
+                try:
+                    ohlcv = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=20)
+                    closes = [c[4] for c in ohlcv]
+                    rsi = calc_rsi(closes)
+                    price = closes[-1] if closes else 0
+                    coin = symbol.split('/')[0]
+                    rsi_list.append({'coin': coin, 'rsi': rsi, 'price': price})
+                except Exception:
+                    continue
+            UI_CACHE.update({'total_net': round(total, 2), 'open_count': open_count, 'scanned': min(idx+5, 60), 'current': batch[0].split('/')[0] if batch else '', 'rsi_list': rsi_list, 'updated': datetime.now().strftime('%H:%M:%S')})
+            idx = (idx + 5) % 60
+        except Exception as e:
+            print(f"[UI] scanner error: {e}")
+        time.sleep(60)
+
 try:
     from flask import Flask
     app = Flask(__name__)
     @app.route('/')
     def home():
-        return 'V30030 MERGED CORRECTED - OK', 200
+        cards = ''
+        for item in UI_CACHE['rsi_list']:
+            cards += f"<div class='card'><div><b>{item['coin']}</b> <span class='long'>LONG</span></div><div class='sub'>RSI {item['rsi']} ${item['price']:.4f}</div></div>"
+        if not cards:
+            cards = "<div class='card'>جاري فحص العملات... انتظر دقيقة</div>"
+        return f'''<!DOCTYPE html><html dir="rtl" lang="ar"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>V30030</title><style>body{{background:#000;color:#fff;font-family:system-ui;margin:0;padding:12px}} .top{{border:2px solid #1a7a3a;border-radius:20px;padding:16px;background:#111}} .big{{font-size:42px;font-weight:bold}} .pill{{background:#f5b301;color:#000;border-radius:20px;padding:4px 12px;display:inline-block}} .card{{border:2px solid #1a7a3a;border-radius:16px;padding:12px;margin:10px 0;background:#0d1a2a}} .long{{background:#22c55e;color:#000;border-radius:12px;padding:2px 8px;font-size:12px}} .sub{{color:#aaa;margin-top:6px}} .btn{{background:#1a2a3a;border-radius:20px;padding:6px 14px;display:inline-block;margin:4px}} h2{{margin:20px 0 0}}</style></head><body><div class="top"><div>60 <span style="float:left">V30030 عقد صحيح 🟢</span></div><div class="big">${UI_CACHE['total_net']}</div><div>صافي كلي (بعد 0.04 رسوم لكل صفقة)</div><div>🔍 فحص LIVE - {UI_CACHE['current']} &nbsp; {UI_CACHE['scanned']}/60</div><div><span class="btn">{UI_CACHE['open_count']}/2 مفتوح</span> <span class="btn">{UI_CACHE['scanned']}/60</span></div><div>آخر تحديث: {UI_CACHE['updated']}</div></div><h2>📊 كل العملات RSI</h2>{cards}</body></html>''', 200
     @app.route('/health')
     def health():
         return {'bot': 'v30030_merged_corrected', 'live': True}, 200
@@ -228,6 +286,7 @@ def check_positions():
 def run():
     print(f"V30030 MERGED - ONLY_UP - NET_AFTER_FEE - {datetime.now()}")
     if app is not None:
+        threading.Thread(target=ui_scanner, daemon=True).start()
         threading.Thread(target=lambda: app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000))), daemon=True).start()
     print(f"LOSS {LOSS_FIXED} FEE {FEE} LEVELS {LEVELS} ONLY_UP COINS={len(COINS_60)}")
     try:
