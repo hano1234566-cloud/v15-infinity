@@ -1,3 +1,4 @@
+# V30033: tdMode isolated on close orders + stop trigger coin size
 # V30030 MERGED CORRECTED - UI version: same interface layout as screenshot, live OKX numbers
 # Correction 2026-11-04: OKX secret now uses V30026 working names:
 #   OKX_SECRET_KEY primary, OKX_SECRET fallback (merged draft used ONLY OKX_SECRET,
@@ -200,6 +201,19 @@ def select_strong_coins(limit=2):
     return result
 
 
+
+def position_size_coins(pos):
+        try:
+            notional = float(pos.get('notional') or 0)
+            entry = float(pos.get('entryPrice') or 0)
+            if notional and entry:
+                return abs(notional) / abs(entry)
+        except Exception:
+            pass
+        contracts = float(pos.get('contracts') or 0)
+    print('warning fallback to contracts', contracts)
+return contracts
+                                           
 def profit_dollar_to_trigger_price(entry_price, desired_profit_dollar, position_size_coins, side='long'):
     # LONG: trigger = entry + desired_profit / size; SHORT: entry - desired_profit / size
     # TODO: confirm the size field on a real position before live use: contracts
@@ -214,7 +228,7 @@ def place_stop_loss_real(symbol, trigger_price, position_size, side='long', last
     try:
         order_side = 'sell' if side == 'long' else 'buy'; pos_side = 'long' if side == 'long' else 'short'
         order = exchange.create_order(symbol, 'stop_market', order_side, position_size, None,
-                                      {'stopLossPrice': trigger_price, 'reduceOnly': True, 'posSide': pos_side})
+                                      {'stopLossPrice': trigger_price, 'reduceOnly': True, 'posSide': pos_side, 'tdMode': 'isolated'})
         order_id = order.get('id') if isinstance(order, dict) else None
         print(f"[{symbol}] REAL SL placed trigger={trigger_price} id={order_id}")
         return (order_id is not None), order_id
@@ -290,7 +304,7 @@ def check_positions():
             if net <= EMERGENCY_CLOSE_NET:
                 try:
                     close_side = 'sell' if pos.get('side', 'long') == 'long' else 'buy'; pos_side = 'long' if pos.get('side', 'long') == 'long' else 'short'
-                    order = exchange.create_order(symbol, 'market', close_side, contracts, None, {'reduceOnly': True, 'posSide': pos_side})
+                    order = exchange.create_order(symbol, 'market', close_side, contracts, None, {'reduceOnly': True, 'posSide': pos_side, 'tdMode': 'isolated'})
                     oid = order.get('id') if isinstance(order, dict) else None
                     print(f"[EMERGENCY CLOSE] {symbol} net={net:.2f} closed at market id={oid}")
                     if symbol in state:
@@ -304,7 +318,7 @@ def check_positions():
                 try:
                     close_side = 'sell' if pos.get('side', 'long') == 'long' else 'buy'; pos_side = 'long' if pos.get('side', 'long') == 'long' else 'short'
                     partial_amt = contracts * PARTIAL_CLOSE_FRACTION
-                    order = exchange.create_order(symbol, 'market', close_side, partial_amt, None, {'reduceOnly': True, 'posSide': pos_side})
+                    order = exchange.create_order(symbol, 'market', close_side, partial_amt, None, {'reduceOnly': True, 'posSide': pos_side, 'tdMode': 'isolated'})
                     oid = order.get('id') if isinstance(order, dict) else None
                     print(f"[PARTIAL CLOSE] {symbol} net={net:.2f} closed 50% id={oid}")
                     state[symbol] = {**state.get(symbol, {}), 'partial_closed': True, 'partial_net': net, 'partial_time': str(datetime.now())}
@@ -315,7 +329,7 @@ def check_positions():
             new = get_stop_only_up(net, curr)
             print(f"[{symbol}] gross={gross} net={net:.2f} contracts={contracts} SL {curr}->{new}")
             if new > curr:
-                trigger = profit_dollar_to_trigger_price(pos.get('entryPrice'), new, contracts, pos.get('side', 'long'))
+                trigger = profit_dollar_to_trigger_price(pos.get('entryPrice'), new, position_size_coins(pos), pos.get('side', 'long'))
                 if trigger is None:
                     print(f"{symbol} SKIP: cannot compute trigger price")
                     continue
