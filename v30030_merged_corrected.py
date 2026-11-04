@@ -100,6 +100,10 @@ FEE = 0.04
 LEVELS = [(0.30, 0.10), (0.80, 0.50), (1.20, 0.80), (2.00, 1.40)]
 LEVERAGE = 5
 USD_PER_TRADE = 5
+# Emergency close, authorized by user 2026-11-04: if a trade is still open and net <= -1.00,
+# the stop has failed to close it, so close it at market immediately to keep loss small.
+# -1.00 is the max emergency loss per trade in this version, not -12, not unlimited.
+EMERGENCY_CLOSE_NET = -1.00
 
 def load_state():
     if os.path.exists(STATE_FILE):
@@ -265,6 +269,19 @@ def check_positions():
             # Log every open position, even outside the list, so old trades stay visible.
             print(f"PERF {symbol} side={pos.get('side')} entry={pos.get('entryPrice')} contracts={contracts} gross={gross} net_after_fee={net:.2f} in_list={symbol in COINS_60}")
             if symbol not in COINS_60: continue
+            # Emergency act: stop failed, position still open and bleeding past -1.00.
+            if net <= EMERGENCY_CLOSE_NET:
+                try:
+                    close_side = 'sell' if pos.get('side', 'long') == 'long' else 'buy'
+                    order = exchange.create_order(symbol, 'market', close_side, contracts, None, {'reduceOnly': True})
+                    oid = order.get('id') if isinstance(order, dict) else None
+                    print(f"[EMERGENCY CLOSE] {symbol} net={net:.2f} closed at market id={oid}")
+                    if symbol in state:
+                        del state[symbol]
+                        save_state(state)
+                except Exception as e:
+                    print(f"[EMERGENCY CLOSE FAILED] {symbol} net={net:.2f} error={e}")
+                continue
             curr = state.get(symbol, {}).get('sl', LOSS_FIXED)
             new = get_stop_only_up(net, curr)
             print(f"[{symbol}] gross={gross} net={net:.2f} contracts={contracts} SL {curr}->{new}")
