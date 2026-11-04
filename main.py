@@ -214,7 +214,7 @@ def place_stop_loss_real(symbol, trigger_price, position_size, side='long'):
     try:
         order_side = 'sell' if side == 'long' else 'buy'
         order = exchange.create_order(symbol, 'stop_market', order_side, position_size, None,
-                                      {'stopLossPrice': trigger_price, 'reduceOnly': True})
+                                      {'stopLossPrice': trigger_price, 'reduceOnly': True, 'posSide': 'net'})
         order_id = order.get('id') if isinstance(order, dict) else None
         print(f"[{symbol}] REAL SL placed trigger={trigger_price} id={order_id}")
         return (order_id is not None), order_id
