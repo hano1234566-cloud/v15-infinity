@@ -212,7 +212,7 @@ def position_size_coins(pos):
             pass
         contracts = float(pos.get('contracts') or 0)
     print('warning fallback to contracts', contracts)
-return contracts
+    return contracts
                                            
 def profit_dollar_to_trigger_price(entry_price, desired_profit_dollar, position_size_coins, side='long'):
     # LONG: trigger = entry + desired_profit / size; SHORT: entry - desired_profit / size
