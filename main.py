@@ -209,12 +209,12 @@ def profit_dollar_to_trigger_price(entry_price, desired_profit_dollar, position_
     per_coin = desired_profit_dollar / position_size_coins
     return entry_price + per_coin if side == 'long' else entry_price - per_coin
 
-def place_stop_loss_real(symbol, trigger_price, position_size, side='long'):
-    # Returns (True, order_id) only if the exchange confirms, else (False, None).
+def place_stop_loss_real(symbol, trigger_price, position_size, side='long', last_price=None):
+    if last_price is not None and ((side == 'long' and trigger_price >= last_price) or (side == 'short' and trigger_price <= last_price)): print(f"[{symbol}] SKIP STOP trigger={trigger_price} last={last_price}"); return False, None
     try:
-        order_side = 'sell' if side == 'long' else 'buy'
+        order_side = 'sell' if side == 'long' else 'buy'; pos_side = 'long' if side == 'long' else 'short'
         order = exchange.create_order(symbol, 'stop_market', order_side, position_size, None,
-                                      {'stopLossPrice': trigger_price, 'reduceOnly': True, 'posSide': 'net'})
+                                      {'stopLossPrice': trigger_price, 'reduceOnly': True, 'posSide': pos_side})
         order_id = order.get('id') if isinstance(order, dict) else None
         print(f"[{symbol}] REAL SL placed trigger={trigger_price} id={order_id}")
         return (order_id is not None), order_id
@@ -289,8 +289,8 @@ def check_positions():
             # Emergency act: stop failed, position still open and bleeding past -1.00.
             if net <= EMERGENCY_CLOSE_NET:
                 try:
-                    close_side = 'sell' if pos.get('side', 'long') == 'long' else 'buy'
-                    order = exchange.create_order(symbol, 'market', close_side, contracts, None, {'reduceOnly': True, 'posSide': 'net'})
+                    close_side = 'sell' if pos.get('side', 'long') == 'long' else 'buy'; pos_side = 'long' if pos.get('side', 'long') == 'long' else 'short'
+                    order = exchange.create_order(symbol, 'market', close_side, contracts, None, {'reduceOnly': True, 'posSide': pos_side})
                     oid = order.get('id') if isinstance(order, dict) else None
                     print(f"[EMERGENCY CLOSE] {symbol} net={net:.2f} closed at market id={oid}")
                     if symbol in state:
@@ -302,9 +302,9 @@ def check_positions():
             # Partial close: first time only, lock half the profit at market.
             if net >= PARTIAL_CLOSE_NET and not state.get(symbol, {}).get('partial_closed'):
                 try:
-                    close_side = 'sell' if pos.get('side', 'long') == 'long' else 'buy'
+                    close_side = 'sell' if pos.get('side', 'long') == 'long' else 'buy'; pos_side = 'long' if pos.get('side', 'long') == 'long' else 'short'
                     partial_amt = contracts * PARTIAL_CLOSE_FRACTION
-                    order = exchange.create_order(symbol, 'market', close_side, partial_amt, None, {'reduceOnly': True, 'posSide': 'net'})
+                    order = exchange.create_order(symbol, 'market', close_side, partial_amt, None, {'reduceOnly': True, 'posSide': pos_side})
                     oid = order.get('id') if isinstance(order, dict) else None
                     print(f"[PARTIAL CLOSE] {symbol} net={net:.2f} closed 50% id={oid}")
                     state[symbol] = {**state.get(symbol, {}), 'partial_closed': True, 'partial_net': net, 'partial_time': str(datetime.now())}
@@ -320,7 +320,7 @@ def check_positions():
                     print(f"{symbol} SKIP: cannot compute trigger price")
                     continue
                 print(f"{symbol} NET:{net:.2f} -> UP SL ${curr} => ${new} trigger={trigger}")
-                ok, order_id = place_stop_loss_real(symbol, trigger, contracts, pos.get('side', 'long'))
+                ok, order_id = place_stop_loss_real(symbol, trigger, contracts, pos.get('side', 'long'), pos.get('markPrice') or pos.get('lastPrice'))
                 if ok:
                     state[symbol] = {'sl': new, 'trigger': trigger, 'order_id': order_id, 'net': net, 'time': str(datetime.now())}
                     save_state(state)
