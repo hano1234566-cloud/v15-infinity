@@ -290,7 +290,7 @@ def check_positions():
             if net <= EMERGENCY_CLOSE_NET:
                 try:
                     close_side = 'sell' if pos.get('side', 'long') == 'long' else 'buy'
-                    order = exchange.create_order(symbol, 'market', close_side, contracts, None, {'reduceOnly': True})
+                    order = exchange.create_order(symbol, 'market', close_side, contracts, None, {'reduceOnly': True, 'posSide': 'net'})
                     oid = order.get('id') if isinstance(order, dict) else None
                     print(f"[EMERGENCY CLOSE] {symbol} net={net:.2f} closed at market id={oid}")
                     if symbol in state:
@@ -304,7 +304,7 @@ def check_positions():
                 try:
                     close_side = 'sell' if pos.get('side', 'long') == 'long' else 'buy'
                     partial_amt = contracts * PARTIAL_CLOSE_FRACTION
-                    order = exchange.create_order(symbol, 'market', close_side, partial_amt, None, {'reduceOnly': True})
+                    order = exchange.create_order(symbol, 'market', close_side, partial_amt, None, {'reduceOnly': True, 'posSide': 'net'})
                     oid = order.get('id') if isinstance(order, dict) else None
                     print(f"[PARTIAL CLOSE] {symbol} net={net:.2f} closed 50% id={oid}")
                     state[symbol] = {**state.get(symbol, {}), 'partial_closed': True, 'partial_net': net, 'partial_time': str(datetime.now())}
