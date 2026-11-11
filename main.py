@@ -37,6 +37,28 @@
 # Do NOT push until the user approves this exact file (stop-after-failure rule).
 # Muse does NOT run this live; the user runs it himself on Render with his own
 # OKX keys. Do NOT push until the user approves this exact file.
+# V30036 change 2026-11-11 (protection fixes only, from external code review
+# CODE-REVIEW-001, approved by the owner). FOUR fixes, nothing else:
+# (1) Initial stop: check_positions now places the stop at the CURRENT level
+#     (starting at LOSS_FIXED -0.20) whenever no stop order is proven in state
+#     (no order_id), not only when the level rises. State updates only on a
+#     confirmed placement; a price-side guard skip leaves state untouched so
+#     placement is retried next cycle.
+# (2) Position counting: open_trial_positions ABORTS opening entirely if
+#     fetch_positions fails (no more continuing with an empty dict), and counts
+#     every position with contracts > 0 in a list instead of a symbol dict.
+# (3) State cleanup: check_positions deletes state entries whose symbol is no
+#     longer actually open, saving once if anything was removed.
+# (4) Post-close verification: emergency close deletes state and prints
+#     "closed" ONLY after re-fetching positions and confirming the position is
+#     gone (else prints EMERGENCY CLOSE UNCONFIRMED and keeps state); partial
+#     close sets partial_closed ONLY after verifying contracts decreased (else
+#     prints PARTIAL CLOSE UNCONFIRMED and leaves the flag unset).
+# ALL financial constants UNCHANGED: LOSS_FIXED -0.20, FEE 0.04, LEVELS,
+# PARTIAL_CLOSE_NET 1.20, PARTIAL_CLOSE_FRACTION 0.5, LEVERAGE 5,
+# USD_PER_TRADE 5, MAX_OPEN_TRADES 6, EMERGENCY_CLOSE_NET -1.00, COINS_60.
+# DRAFT — لا يُدفع إلا باعتماد المالك لهذا الملف بالضبط.
+# (Do NOT push unless the owner approves THIS exact file.)
 
 import ccxt, os, json, time, threading
 from datetime import datetime
@@ -273,13 +295,17 @@ def open_trial_positions(symbols=None, usd=USD_PER_TRADE, leverage=LEVERAGE):
             print("[OPEN] No strong-chart coin passed filters, opening NOTHING this cycle.")
             return
     try:
-        existing = {}
+        # V30036 fix (2): count EVERY open position (contracts > 0) in a list,
+        # not one entry per symbol in a dict; and if fetch_positions fails,
+        # ABORT opening entirely instead of continuing with an empty count.
+        existing = []
         try:
             for pos in exchange.fetch_positions():
-                if pos.get('contracts'):
-                    existing[pos['symbol']] = pos
+                if float(pos.get('contracts', 0) or 0) > 0:
+                    existing.append(pos)
         except Exception as e:
-            print(f"fetch existing positions failed: {e}")
+            print(f"[OPEN] ABORT: fetch existing positions failed: {e} - opening NOTHING this cycle.")
+            return
         if len(existing) >= MAX_OPEN_TRADES:
             print(f"[OPEN] SKIP NEW: {len(existing)} trades already open, managing old trades first, no new trades.")
             return
@@ -289,8 +315,9 @@ def open_trial_positions(symbols=None, usd=USD_PER_TRADE, leverage=LEVERAGE):
             if opened >= slots:
                 print(f"[OPEN] CAP: open-trade limit {MAX_OPEN_TRADES} total reached, no more new trades.")
                 break
-            if symbol in existing:
-                pos = existing[symbol]
+            already = [p for p in existing if p['symbol'] == symbol]
+            if already:
+                pos = already[0]
                 print(f"[{symbol}] SKIP OPEN: already open contracts={pos.get('contracts')} entryPrice={pos.get('entryPrice')}")
                 continue
             try:
@@ -323,6 +350,15 @@ def check_positions():
         positions = exchange.fetch_positions()
         open_syms = [p['symbol'] for p in positions if float(p.get('contracts', 0) or 0) > 0]
         print(f"OPEN NOW: {open_syms}")
+        # V30036 fix (3): drop state entries for symbols no longer actually
+        # open, so a later new position on the same symbol cannot inherit a
+        # stale stop level or partial_closed flag. Keys stay symbol-based.
+        stale = [s for s in list(state.keys()) if s not in open_syms]
+        if stale:
+            for s in stale:
+                del state[s]
+                print(f"[STATE] removed stale entry for no-longer-open symbol {s}")
+            save_state(state)
         for pos in positions:
             symbol = pos['symbol']
             contracts = float(pos.get('contracts', 0) or 0)
@@ -340,10 +376,29 @@ def check_positions():
                     pos_side = 'long' if pos.get('side', 'long') == 'long' else 'short'
                     order = exchange.create_order(symbol, 'market', close_side, contracts, None, {'reduceOnly': True, 'tdMode': 'isolated', 'posSide': pos_side})
                     oid = order.get('id') if isinstance(order, dict) else None
-                    print(f"[EMERGENCY CLOSE] {symbol} net={net:.2f} closed at market id={oid}")
-                    if symbol in state:
-                        del state[symbol]
-                        save_state(state)
+                    # V30036 fix (4a): verify BEFORE claiming the close and
+                    # BEFORE deleting state - re-fetch positions and confirm
+                    # this symbol is gone or its contracts are zero. If it is
+                    # still open (or verification itself failed), keep state;
+                    # the main loop retries the emergency close next cycle.
+                    still_open = None
+                    try:
+                        for p2 in exchange.fetch_positions():
+                            if p2['symbol'] == symbol:
+                                still_open = float(p2.get('contracts', 0) or 0)
+                                break
+                        if still_open is None:
+                            still_open = 0.0
+                    except Exception as ve:
+                        print(f"[EMERGENCY CLOSE] {symbol} post-close verify failed: {ve}")
+                        still_open = None
+                    if still_open == 0.0:
+                        print(f"[EMERGENCY CLOSE] {symbol} net={net:.2f} closed at market id={oid}")
+                        if symbol in state:
+                            del state[symbol]
+                            save_state(state)
+                    else:
+                        print(f"[EMERGENCY CLOSE UNCONFIRMED] {symbol} net={net:.2f} order id={oid} contracts after={still_open} - state kept, will retry next cycle")
                 except Exception as e:
                     print(f"[EMERGENCY CLOSE FAILED] {symbol} net={net:.2f} error={e}")
                 continue
@@ -355,15 +410,38 @@ def check_positions():
                     pos_side = 'long' if pos.get('side', 'long') == 'long' else 'short'
                     order = exchange.create_order(symbol, 'market', close_side, partial_amt, None, {'reduceOnly': True, 'tdMode': 'isolated', 'posSide': pos_side})
                     oid = order.get('id') if isinstance(order, dict) else None
-                    print(f"[PARTIAL CLOSE] {symbol} net={net:.2f} closed 50% id={oid}")
-                    state[symbol] = {**state.get(symbol, {}), 'partial_closed': True, 'partial_net': net, 'partial_time': str(datetime.now())}
-                    save_state(state)
+                    # V30036 fix (4b): set partial_closed ONLY after verifying
+                    # the contracts actually decreased versus before the order.
+                    # If they did not decrease, or verification failed, leave
+                    # the flag unset so the partial close is retried later.
+                    after_contracts = None
+                    try:
+                        for p2 in exchange.fetch_positions():
+                            if p2['symbol'] == symbol:
+                                after_contracts = float(p2.get('contracts', 0) or 0)
+                                break
+                    except Exception as ve:
+                        print(f"[PARTIAL CLOSE] {symbol} post-close verify failed: {ve}")
+                    if after_contracts is not None and after_contracts < contracts:
+                        print(f"[PARTIAL CLOSE] {symbol} net={net:.2f} closed 50% id={oid} contracts {contracts}->{after_contracts}")
+                        state[symbol] = {**state.get(symbol, {}), 'partial_closed': True, 'partial_net': net, 'partial_time': str(datetime.now())}
+                        save_state(state)
+                    else:
+                        print(f"[PARTIAL CLOSE UNCONFIRMED] {symbol} net={net:.2f} order id={oid} contracts before={contracts} after={after_contracts} - flag NOT set, will retry")
                 except Exception as e:
                     print(f"[PARTIAL CLOSE FAILED] {symbol} net={net:.2f} error={e}")
             curr = state.get(symbol, {}).get('sl', LOSS_FIXED)
             new = get_stop_only_up(net, curr)
             print(f"[{symbol}] gross={gross} net={net:.2f} contracts={contracts} SL {curr}->{new}")
-            if new > curr:
+            # V30036 fix (1): initial stop. Previously place_stop_loss_real ran
+            # ONLY when the level rose (new > curr), so a fresh position never
+            # got its -0.20 stop on the exchange. Now, if no stop order is
+            # proven in state (no order_id recorded), place the stop at the
+            # CURRENT level (new == curr, starting at LOSS_FIXED) as well.
+            # State is updated only on success (same pattern as before); if
+            # the price-side guard inside place_stop_loss_real skips it, state
+            # stays untouched and placement is retried next cycle.
+            if new > curr or not state.get(symbol, {}).get('order_id'):
                 size_coins = position_size_coins(pos, contracts)
                 trigger = profit_dollar_to_trigger_price(pos.get('entryPrice'), new, size_coins, pos.get('side', 'long'))
                 if trigger is None:
