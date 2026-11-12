@@ -60,6 +60,30 @@
 # DRAFT — لا يُدفع إلا باعتماد المالك لهذا الملف بالضبط.
 # (Do NOT push unless the owner approves THIS exact file.)
 
+# V30037 change 2026-11-12 (order-management defect fix ONLY, owner order:
+# "leave everything as it is; if you discovered something that needs fixing,
+# fix it"). The defect, proven from the owner's OKX screenshots 2026-11-12:
+# 62 stacked TP/SL orders - every level rise placed a NEW stop without
+# canceling the old one, and every restart placed a fresh set because
+# state.json (with the recorded order_id) does not survive Render restarts.
+# There was NO cancel call anywhere in the code. Fixes, nothing else:
+# (a) cancel-first: before placing a replacement stop, cancel the stop
+#     recorded in state by id; if that cancel fails (order still live),
+#     place NOTHING this cycle and retry next cycle - never stack.
+# (b) adoption sweep: when a position has no proven stop in state (fresh
+#     position or state lost on restart), best-effort fetch the symbol's
+#     open orders (plain + trigger variants) and cancel every leftover bot
+#     stop for it before placing exactly one fresh stop.
+# (c) orphans: when a position closes (verified emergency close) or its
+#     state entry goes stale, cancel its leftover stops; plus a startup
+#     sweep cancels bot stops whose symbol has no open position.
+# A stop order counts as "the bot's own" only if it is reduce-only AND has
+# a stop trigger (stopPrice or info.slTriggerPx); anything else is never
+# touched. ALL strategy and financial constants UNCHANGED: LOSS_FIXED -0.20,
+# FEE 0.04, LEVELS, PARTIAL_CLOSE_NET 1.20, PARTIAL_CLOSE_FRACTION 0.5,
+# LEVERAGE 5, USD_PER_TRADE 5, MAX_OPEN_TRADES 6, EMERGENCY_CLOSE_NET -1.00,
+# COINS_60, opening logic and coin selection UNTOUCHED.
+
 import ccxt, os, json, time, threading
 from datetime import datetime
 # UI cache, updated by a background scanner, so the homepage is fast.
@@ -285,6 +309,88 @@ def place_stop_loss_real(symbol, trigger_price, position_size, side='long', last
         print(f"SL Error {symbol}: {e}")
         return False, None
 
+def _is_bot_stop_order(order):
+    # The bot's own stops only: reduce-only AND carrying a stop trigger.
+    # Anything else on the account is never touched by the cleanup.
+    try:
+        if not order.get('reduceOnly'):
+            return False
+        if order.get('stopPrice'):
+            return True
+        info = order.get('info') or {}
+        return bool(info.get('slTriggerPx'))
+    except Exception:
+        return False
+
+
+def _cancel_one_stop(symbol, order_id):
+    # True if the order is gone afterwards (canceled now, or already gone:
+    # OKX 51603 / not-found both mean it cannot stack or fire anymore).
+    # False only when the cancel genuinely failed and the order may live.
+    try:
+        exchange.cancel_order(order_id, symbol)
+        print(f"[{symbol}] CLEANUP canceled stop id={order_id}")
+        return True
+    except Exception as e:
+        msg = str(e).lower()
+        if '51603' in msg or 'not found' in msg or 'not exist' in msg or 'does not exist' in msg:
+            print(f"[{symbol}] CLEANUP stop id={order_id} already gone ({e})")
+            return True
+        print(f"[{symbol}] CLEANUP cancel FAILED id={order_id}: {e}")
+        return False
+
+
+def sweep_symbol_stops(symbol, keep_id=None):
+    # Best-effort: cancel every leftover bot stop for this symbol found via
+    # open-orders fetch (plain and trigger/algo variants). Returns False
+    # only when a stop we could SEE could not be canceled. A failed fetch
+    # just logs: unseen orders cannot be canceled, but they must not block
+    # stop placement either (the recorded-order cancel is the hard gate).
+    ok_all = True
+    seen = set()
+    for params in (None, {'trigger': True}):
+        try:
+            orders = exchange.fetch_open_orders(symbol) if params is None else exchange.fetch_open_orders(symbol, None, None, params)
+        except Exception as e:
+            print(f"[{symbol}] SWEEP fetch_open_orders failed (params={params}): {e}")
+            continue
+        for o in orders or []:
+            oid = o.get('id')
+            if not oid or oid == keep_id or oid in seen:
+                continue
+            seen.add(oid)
+            if not _is_bot_stop_order(o):
+                continue
+            if not _cancel_one_stop(symbol, oid):
+                ok_all = False
+    return ok_all
+
+
+def startup_orphan_sweep():
+    # Once at startup: cancel bot stops whose symbol has NO open position
+    # (leftovers of trades that closed while the bot was down).
+    try:
+        open_syms = {p['symbol'] for p in exchange.fetch_positions() if float(p.get('contracts', 0) or 0) > 0}
+    except Exception as e:
+        print(f"[SWEEP] startup sweep skipped, fetch_positions failed: {e}")
+        return
+    seen = set()
+    for params in (None, {'trigger': True}):
+        try:
+            orders = exchange.fetch_open_orders(None) if params is None else exchange.fetch_open_orders(None, None, None, params)
+        except Exception as e:
+            print(f"[SWEEP] startup fetch_open_orders failed (params={params}): {e}")
+            continue
+        for o in orders or []:
+            oid = o.get('id')
+            sym = o.get('symbol')
+            if not oid or oid in seen or not sym or sym in open_syms:
+                continue
+            seen.add(oid)
+            if _is_bot_stop_order(o):
+                _cancel_one_stop(sym, oid)
+
+
 def open_trial_positions(symbols=None, usd=USD_PER_TRADE, leverage=LEVERAGE):
     # Once at startup only, NOT every loop. $5 notional per position
     # (margin about $1 at 5x isolated, NOT $5 margin / $25 notional).
@@ -358,6 +464,8 @@ def check_positions():
             for s in stale:
                 del state[s]
                 print(f"[STATE] removed stale entry for no-longer-open symbol {s}")
+                # V30037: its exchange-side stops are orphans now - cancel them.
+                sweep_symbol_stops(s)
             save_state(state)
         for pos in positions:
             symbol = pos['symbol']
@@ -397,6 +505,8 @@ def check_positions():
                         if symbol in state:
                             del state[symbol]
                             save_state(state)
+                        # V30037: cancel this symbol's leftover stop orders.
+                        sweep_symbol_stops(symbol)
                     else:
                         print(f"[EMERGENCY CLOSE UNCONFIRMED] {symbol} net={net:.2f} order id={oid} contracts after={still_open} - state kept, will retry next cycle")
                 except Exception as e:
@@ -447,6 +557,27 @@ def check_positions():
                 if trigger is None:
                     print(f"{symbol} SKIP: cannot compute trigger price")
                     continue
+                # V30037 cancel-first: NEVER stack a new stop on top of old
+                # ones. (a) Cancel the stop recorded in state by id; if that
+                # cancel fails the old order may still be live, so place
+                # NOTHING this cycle and retry next cycle. (b) Sweep any
+                # other leftover bot stops for this symbol (restart
+                # duplicates); a visible-but-uncancelable one also defers.
+                old_id = state.get(symbol, {}).get('order_id')
+                if old_id and not _cancel_one_stop(symbol, old_id):
+                    print(f"[{symbol}] STOP DEFERRED - old stop id={old_id} still live, will retry next cycle")
+                    continue
+                if not sweep_symbol_stops(symbol):
+                    print(f"[{symbol}] STOP DEFERRED - leftover stop could not be canceled, will retry next cycle")
+                    continue
+                if old_id:
+                    # The recorded order is gone now; clear it so a failed
+                    # placement below is retried next cycle (V30036 fix 1
+                    # semantics), not silently skipped.
+                    _st = dict(state.get(symbol, {}))
+                    _st['order_id'] = None
+                    state[symbol] = _st
+                    save_state(state)
                 print(f"{symbol} NET:{net:.2f} -> UP SL ${curr} => ${new} trigger={trigger}")
                 ok, order_id = place_stop_loss_real(symbol, trigger, contracts, pos.get('side', 'long'), pos.get('markPrice') or pos.get('lastPrice'))
                 if ok:
@@ -468,6 +599,8 @@ def run():
         print(f"OLD OPEN POSITIONS: {sorted(_existing)}")
     except Exception as e:
         print(f"fetch old positions failed: {e}")
+    # V30037: clear orphan stops from trades closed while the bot was down.
+    startup_orphan_sweep()
     # Trial only: NEAR/ARB $5, skipped if already open.
     open_trial_positions()
     while True:
