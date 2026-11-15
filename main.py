@@ -60,6 +60,21 @@
 # DRAFT — لا يُدفع إلا باعتماد المالك لهذا الملف بالضبط.
 # (Do NOT push unless the owner approves THIS exact file.)
 
+# V30038 DRAFT 2026-11-15 (owner diagnosis: long-only + buys after the rise).
+# ONLY change vs V30037: entry selection/opening gains (a) a mirrored SHORT
+# side and (b) an EARLY-CATCH long: coins that have NOT risen yet (24h move
+# between -1% and +3%), sitting on a tightening base (last-6 range < half
+# the last-24 range), last close at/above avg20, volume picking up. Early
+# picks are capped at half the slots so momentum entries keep their share.
+# select_coins() returns (symbol, side): LONG needs up-momentum (last>prev24,
+# last>avg20, volume up); SHORT needs the exact mirror (last<prev24,
+# last<avg20, volume up). Ranked together by |momentum|. Opening a short
+# uses a market SELL with posSide 'short'. Management code (stops, partial,
+# emergency) already handled shorts and is UNTOUCHED, as are ALL financial
+# constants: LOSS_FIXED -0.20, FEE 0.04, LEVELS, PARTIAL 1.20 x0.5,
+# LEVERAGE 5, USD_PER_TRADE 5, MAX_OPEN_TRADES 6, EMERGENCY -1.00, COINS_60.
+# DRAFT - do NOT push without the owner approving THIS exact file.
+#
 # V30037 change 2026-11-12 (order-management defect fix ONLY, owner order:
 # "leave everything as it is; if you discovered something that needs fixing,
 # fix it"). The defect, proven from the owner's OKX screenshots 2026-11-12:
@@ -225,19 +240,23 @@ def get_amount(symbol, usd):
     return amt
 
 def select_strong_coins(limit=MAX_OPEN_TRADES):
-    """Strong-chart selection, NOT fixed NEAR/ARB.
+    """Strong-chart selection, NOT fixed NEAR/ARB. V30038: BOTH sides.
     User rule 2026-11-04: entry coin is not necessarily NEAR/ARB, important is
-    the chart is strong for entry.
+    the chart is strong for entry. Owner diagnosis 2026-11-15: long-only +
+    buying after the rise made the longs lose; a mirrored SHORT side added.
     Strong = defined here, transparently, so it can be tuned after live test:
       - fetch 1h OHLCV, last 50 candles
-      - 24h-style momentum: last close > close 24 candles ago
-      - trend: last close > simple average of last 20 closes
-      - volume: last candle volume > average volume of last 20
-    Coins failing any filter are skipped. Rank passing coins by momentum %.
+      - volume: last candle volume > average volume of last 20 (both sides)
+      - LONG:  last close > close 24 candles ago AND last close > avg20
+      - SHORT: last close < close 24 candles ago AND last close < avg20
+    Coins failing the volume filter or sitting between the trends are
+    skipped. Rank passing coins by |momentum %| regardless of side.
     If NO coin passes, return [] (do NOT fall back to a weak coin blindly).
     This is NOT a proven profitable signal, it is a transparent filter to test.
+    Returns a list of (symbol, side) with side 'long' or 'short'.
     """
     scored = []
+    early = []
     for symbol in COINS_60:
         try:
             ohlcv = exchange.fetch_ohlcv(symbol, timeframe="1h", limit=50)
@@ -245,24 +264,45 @@ def select_strong_coins(limit=MAX_OPEN_TRADES):
                 continue
             closes = [c[4] for c in ohlcv]
             volumes = [c[5] for c in ohlcv]
+            highs = [c[2] for c in ohlcv]
+            lows = [c[3] for c in ohlcv]
             last = closes[-1]
             prev24 = closes[-25]
             avg20 = sum(closes[-20:]) / 20
             avg_vol20 = sum(volumes[-20:]) / 20
             momentum_pct = (last - prev24) / prev24 * 100 if prev24 else 0
-            if last <= prev24:
-                continue
-            if last <= avg20:
-                continue
             if volumes[-1] <= avg_vol20:
                 continue
-            scored.append((momentum_pct, symbol))
+            if last > prev24 and last > avg20:
+                scored.append((abs(momentum_pct), symbol, 'long'))
+            elif last < prev24 and last < avg20:
+                scored.append((abs(momentum_pct), symbol, 'short'))
+            # EARLY-CATCH long (owner 2026-11-15): the coin has NOT risen yet
+            # (24h move between -1% and +3%), price holds at/above avg20, and
+            # the last 6 candles are compressed into less than half the
+            # last-24 range (a tightening base before expansion). Volume
+            # pickup is already required above. Ranked by volume surge.
+            range6 = max(highs[-6:]) - min(lows[-6:])
+            range24 = max(highs[-24:]) - min(lows[-24:])
+            if (-1.0 <= momentum_pct <= 3.0 and last >= avg20
+                    and range24 > 0 and range6 < 0.5 * range24):
+                early.append((volumes[-1] / avg_vol20 if avg_vol20 else 0, symbol))
         except Exception as e:
             print(f"[SELECT] {symbol} skipped: {e}")
             continue
     scored.sort(reverse=True)
-    result = [s for _, s in scored[:limit]]
-    print(f"[SELECT] Strong coins: {result} from {len(scored)} passing filters")
+    early.sort(reverse=True)
+    early_cap = max(1, limit // 2)
+    result = [(s, 'long') for _, s in early[:early_cap]]
+    used = {s for s, _ in result}
+    for _, s, side in scored:
+        if len(result) >= limit:
+            break
+        if s in used:
+            continue
+        result.append((s, side))
+        used.add(s)
+    print(f"[SELECT] Early-catch: {early[:early_cap]} | Strong coins: {result} from {len(scored)} momentum + {len(early)} early passing filters")
     return result
 
 
@@ -417,7 +457,7 @@ def open_trial_positions(symbols=None, usd=USD_PER_TRADE, leverage=LEVERAGE):
             return
         slots = MAX_OPEN_TRADES - len(existing)
         opened = 0
-        for symbol in symbols:
+        for symbol, side in symbols:
             if opened >= slots:
                 print(f"[OPEN] CAP: open-trade limit {MAX_OPEN_TRADES} total reached, no more new trades.")
                 break
@@ -432,9 +472,13 @@ def open_trial_positions(symbols=None, usd=USD_PER_TRADE, leverage=LEVERAGE):
                 print(f"[{symbol}] set_leverage failed (continuing, check OKX settings): {e}")
             amount = get_amount(symbol, usd)
             try:
-                order = exchange.create_market_buy_order(symbol, float(amount),
-                                                         {'tdMode': 'isolated', 'posSide': 'long'})
-                print(f"[{symbol}] OPEN order id={order.get('id') if isinstance(order, dict) else order}")
+                if side == 'short':
+                    order = exchange.create_market_sell_order(symbol, float(amount),
+                                                              {'tdMode': 'isolated', 'posSide': 'short'})
+                else:
+                    order = exchange.create_market_buy_order(symbol, float(amount),
+                                                             {'tdMode': 'isolated', 'posSide': 'long'})
+                print(f"[{symbol}] OPEN {side} order id={order.get('id') if isinstance(order, dict) else order}")
                 opened += 1
             except Exception as e:
                 print(f"[{symbol}] OPEN FAILED: {e}")
